@@ -24,7 +24,7 @@ module.exports = async (req, res) => {
 
   // Se não tiver payload, mostra mensagem de status
   if (!payload) {
-    return res.json({ status: "Online", message: "Vercel Proxy Ativo" });
+    return res.json({ status: "Online" });
   }
 
   // === VALIDAÇÃO DE SEGURANÇA ===
