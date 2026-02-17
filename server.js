@@ -3,8 +3,6 @@ const https = require('https');
 const { URL } = require('url');
 
 const PORT = process.env.PORT || 8880;
-
-// domínio do SEU painel (onde roda live.php, stream.php etc)
 const PANEL_URL = process.env.PANEL_URL || 'http://playagr.sbs';
 
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 500, keepAliveMsecs: 30000 });
@@ -21,7 +19,6 @@ http.createServer((req, res) => {
             return;
         }
 
-        // /live/usuario/senha/id.ts -> PANEL_URL/live/usuario/senha/id.ts
         const backendUrl = new URL(req.url, PANEL_URL);
         const lib = backendUrl.protocol === 'https:' ? https : http;
         const agent = backendUrl.protocol === 'https:' ? httpsAgent : httpAgent;
