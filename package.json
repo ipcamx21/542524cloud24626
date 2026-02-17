@@ -1,7 +1,7 @@
 {
-  "name": "vps-manager-proxy",
+  "name": "streaming-proxy",
   "version": "1.0.0",
-  "description": "Proxy Server for VPS Manager",
+  "description": "Smart Proxy for IPTV Streaming",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
