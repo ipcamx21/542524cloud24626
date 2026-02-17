@@ -98,7 +98,10 @@ const server = http.createServer(async (req, res) => {
             ...req.headers,
             'Host': target.host,
             'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
+        },
+        // --- FIXES FOR SOCKET HANG UP ---
+        rejectUnauthorized: false, // Ignore SSL errors (self-signed certs)
+        family: 4 // Force IPv4 (some providers block IPv6)
     };
     
     // Remove headers that might cause issues
