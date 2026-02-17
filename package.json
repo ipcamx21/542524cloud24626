@@ -1,15 +1,8 @@
 {
-  "name": "streaming-proxy",
+  "name": "w5p-proxy",
   "version": "1.0.0",
-  "description": "Smart Proxy for IPTV Streaming",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
-  },
-  "dependencies": {
-    "mysql2": "^3.9.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
