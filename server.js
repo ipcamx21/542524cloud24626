@@ -5,7 +5,7 @@ const url = require('url');
 
 const SECRET_KEY = "VpsManagerStrongKey";
 // Usa a porta do ambiente (Koyeb) OU 80 se não tiver nenhuma definida
-const PORT = process.env.PORT || 80;
+const PORT = process.env.PORT || 8880;
 
 const server = http.createServer(async (req, res) => {
     // 1. Validar Parâmetros Básicos
