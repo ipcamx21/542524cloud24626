@@ -9,16 +9,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET_KEY = "VpsManagerStrongKey";
 
-// ==========================================
-// CACHE DE AUTENTICAÇÃO
-// ==========================================
+// Cache Auth (60s)
 const authCache = new Map();
 function validateUser(authUrl, username, password) {
     return new Promise((resolve) => {
         const cacheKey = `${username}:${password}`;
         const cached = authCache.get(cacheKey);
         if (cached && cached.expires > Date.now()) return resolve(cached.valid);
-
         try {
             const targetUrl = new URL(authUrl);
             targetUrl.searchParams.set('username', username);
@@ -35,11 +32,8 @@ function validateUser(authUrl, username, password) {
     });
 }
 
-// ==========================================
-// BROADCAST BLINDADO (SMART RESTREAM)
-// ==========================================
+// Broadcaster Blindado
 const activeBroadcasts = new Map();
-
 class SecureBroadcaster extends EventEmitter {
     constructor(url) {
         super();
@@ -50,13 +44,10 @@ class SecureBroadcaster extends EventEmitter {
         this.upstreamReq = null;
         this.connect(this.url);
     }
-
     connect(currentUrl, redirects = 0) {
         if (redirects > 5) { this.destroy(); return; }
-        
         const targetUrl = parse(currentUrl);
         const lib = targetUrl.protocol === 'https:' ? https : http;
-
         this.upstreamReq = lib.request(currentUrl, {
             method: 'GET',
             headers: { 'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18', 'Accept': '*/*' }
@@ -69,38 +60,32 @@ class SecureBroadcaster extends EventEmitter {
             this.headers = res.headers;
             this.statusCode = res.statusCode;
             this.emit('ready');
-            
             res.on('data', (chunk) => {
                 this.clients.forEach(c => { try { if(!c.writableEnded) c.write(chunk); } catch(e){} });
             });
             res.on('end', () => this.destroy());
             res.on('error', () => this.destroy());
         });
-        
         this.upstreamReq.on('error', () => this.destroy());
         this.upstreamReq.end();
     }
-
     addClient(res) {
         this.clients.add(res);
         if (this.headers) this.initClient(res);
         else this.once('ready', () => this.initClient(res));
         res.on('close', () => this.removeClient(res));
     }
-
     removeClient(res) {
         this.clients.delete(res);
         if (!res.writableEnded) res.end();
         if (this.clients.size === 0) this.destroy();
     }
-
     initClient(res) {
         if (res.headersSent) return;
         if (this.headers['content-type']) res.setHeader('Content-Type', this.headers['content-type']);
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.writeHead(this.statusCode || 200);
     }
-
     destroy() {
         activeBroadcasts.delete(this.url);
         if (this.upstreamReq) this.upstreamReq.destroy();
@@ -109,20 +94,12 @@ class SecureBroadcaster extends EventEmitter {
     }
 }
 
-// ==========================================
-// ROTA PRINCIPAL
-// ==========================================
 app.get('/api', async (req, res) => {
-    // CORS Obrigatório
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, User-Agent, Authorization');
-
     if (req.method === 'OPTIONS') return res.status(200).end();
 
-    const { payload, expires, token, auth, ext } = req.query;
+    const { payload, expires, token, auth, ext, mode } = req.query;
 
-    // 1. Validação
     if (!payload || !expires || !token) return res.status(403).send("E1");
     if (Date.now() / 1000 > parseInt(expires)) return res.status(403).send("E2");
 
@@ -130,7 +107,6 @@ app.get('/api', async (req, res) => {
     hmac.update(payload + expires + (auth || ''));
     if (token !== hmac.digest('hex')) return res.status(403).send("E3");
 
-    // 2. Descriptografar
     let decodedString;
     try {
         const decoded = Buffer.from(payload, 'base64').toString('binary');
@@ -144,38 +120,33 @@ app.get('/api', async (req, res) => {
     const username = parts[1];
     const password = parts[2];
 
-    // 3. Autenticação Remota
     if (auth && username && password) {
         const isValid = await validateUser(auth, username, password);
         if (!isValid) return res.status(403).send("Bloqueado");
     }
 
     // ==========================================
-    // DETECÇÃO HÍBRIDA: TS vs M3U8
+    // WRAPPER M3U8 (COMPATIBILIDADE IBO PLAYER)
     // ==========================================
-    // O IBO Player pede primeiro a playlist. Se a gente não entregar, ele falha.
-    
-    // Se a URL original termina com .m3u8, o IBO vai adicionar isso no final da URL do proxy?
-    // As vezes sim, as vezes não. O segredo é ver se ele pediu playlist explicitamente.
-    
+    // Se o player pediu .m3u8 OU o cabeçalho diz mpegurl, entregamos a playlist falsa
     const accept = req.headers['accept'] || '';
-    const urlLooksLikeM3U8 = req.url.includes('.m3u8') || req.url.includes('type=m3u8');
-    const isExplicitTS = ext === '.ts' || req.url.includes('.ts'); // Nosso sinal secreto
-
-    // Se parece M3U8 e NÃO pedimos TS explicitamente -> Manda Playlist Falsa
-    if ((urlLooksLikeM3U8 || accept.includes('mpegurl') || accept.includes('apple')) && !isExplicitTS) {
-        // Gera a URL do "Segmento" (que na verdade é o vídeo contínuo)
-        // Adicionamos &ext=.ts para cair no `else` na próxima requisição
-        const selfUrl = `${req.protocol}://${req.get('host')}${req.path}?${new URLSearchParams({...req.query, ext: '.ts'}).toString()}`;
+    const wantsM3U8 = (ext === 'm3u8' || req.url.includes('.m3u8') || accept.includes('mpegurl') || accept.includes('apple'));
+    
+    // Se quiser M3U8 e NÃO estiver no modo 'raw' (streaming direto)
+    if (wantsM3U8 && mode !== 'raw') {
+        // Gera URL apontando para si mesmo com mode=raw (para entregar o TS)
+        // Adicionamos ext=ts para garantir que caia no fluxo correto na próxima
+        const selfUrl = `${req.protocol}://${req.get('host')}${req.path}?${new URLSearchParams({...req.query, mode: 'raw', ext: 'ts'}).toString()}`;
         
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.setHeader('Content-Disposition', 'inline; filename="stream.m3u8"');
         
-        return res.send(`#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:-1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:-1,Stream\n${selfUrl}`);
+        // FORMATO IDÊNTICO AO LIVE.PHP ORIGINAL
+        return res.send(`#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:60\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:60.0,\n${selfUrl}`);
     }
 
     // ==========================================
-    // ENTREGA DO VÍDEO (STREAMING)
+    // STREAMING (TS/VOD)
     // ==========================================
     const isVOD = streamUrl.match(/\.(mp4|mkv|avi|mov)$/i);
     const hasRange = req.headers.range;
