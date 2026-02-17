@@ -102,11 +102,11 @@ const server = http.createServer(async (req, res) => {
         headers: {
             ...req.headers,
             'Host': target.host,
-            'User-Agent': spoofedUA // <--- AQUI ESTÁ A MÁGICA
+            'User-Agent': spoofedUA // <--- O SEGREDO ESTÁ AQUI
         },
         // --- FIXES FOR SOCKET HANG UP ---
-        rejectUnauthorized: false, // Ignore SSL errors
-        family: 4 // Force IPv4
+        rejectUnauthorized: false, // Ignore SSL errors (self-signed certs)
+        family: 4 // Force IPv4 (some providers block IPv6)
     };
     
     // Remove headers that might cause issues
