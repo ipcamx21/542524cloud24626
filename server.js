@@ -2,12 +2,7 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 
-// Porta do proxy (Koyeb / Render)
 const PORT = process.env.PORT || 8880;
-
-// URL do SEU PAINEL (onde roda o live.php, movie.php, series.php)
-// Exemplo: http://playagr.sbs  (sem barra no final)
-// Esse valor NÃO é a fonte IPTV, é só o painel. As fontes continuam no script.
 const PANEL_URL = process.env.PANEL_URL || 'http://playagr.sbs';
 
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 500, keepAliveMsecs: 30000 });
@@ -24,12 +19,10 @@ http.createServer((req, res) => {
             return;
         }
 
-        // Aceita qualquer rota /live|/movie|/series exatamente como o painel
         const backendUrl = new URL(req.url, PANEL_URL);
         const lib = backendUrl.protocol === 'https:' ? https : http;
         const agent = backendUrl.protocol === 'https:' ? httpsAgent : httpAgent;
 
-        // Marcar para o painel que o pedido veio da proxy (evitar loop de use_global_proxy)
         const headers = {
             ...req.headers,
             host: backendUrl.host,
