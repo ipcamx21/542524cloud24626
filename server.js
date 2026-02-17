@@ -82,6 +82,7 @@ const server = http.createServer(async (req, res) => {
     const target = new URL(targetUrl);
     
     // --- CAMUFLAGEM VLC ---
+    // Faz o Render fingir ser VLC para o provedor aceitar a conexão
     const spoofedUA = 'VLC/3.0.18 LibVLC/3.0.18';
 
     const options = {
@@ -92,10 +93,11 @@ const server = http.createServer(async (req, res) => {
         headers: {
             ...req.headers,
             'Host': target.host,
-            'User-Agent': spoofedUA // FINGE SER VLC
+            'User-Agent': spoofedUA // <--- ISSO SALVA O DIA
         },
-        rejectUnauthorized: false, 
-        family: 4 
+        // --- CORREÇÕES DE CONEXÃO ---
+        rejectUnauthorized: false, // Ignora erros de SSL
+        family: 4 // Força IPv4 (evita erros em redes que bloqueiam IPv6)
     };
     
     delete options.headers['host'];
