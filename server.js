@@ -9,6 +9,10 @@ const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 200, keepAlive
 const SECRET_KEY = "VpsManagerStrongKey";
 // Usa a porta do ambiente (Koyeb) OU 80 se não tiver nenhuma definida
 const PORT = process.env.PORT || 8880;
+const ORIGIN_BASE = process.env.ORIGIN_BASE || "";
+const SEG_CACHE_TTL = parseInt(process.env.SEG_CACHE_TTL || "60000"); // 60s
+const SEG_CACHE_MAX = parseInt(process.env.SEG_CACHE_MAX || "128");   // 128 segments
+const segmentCache = new Map(); // key -> { data: Buffer, ts: number }
 
 const server = http.createServer(async (req, res) => {
     // 1. Validar Parâmetros Básicos
@@ -27,43 +31,54 @@ const server = http.createServer(async (req, res) => {
         try { req.socket.setKeepAlive(true, 15000); } catch {}
     }
 
-    const payload = reqUrl.searchParams.get("payload");
+    // Vars que podem vir via token OU via rota sem token
+    let payload = reqUrl.searchParams.get("payload");
+    let targetUrl, username = "", password = "";
 
     // Ignorar requisições sem payload (robôs/scanners)
     if (!payload) {
-        // --- ADIÇÃO: Página Inicial com Status ---
-        if (reqUrl.pathname === '/' || reqUrl.pathname === '/api' || reqUrl.pathname === '/health') {
-            res.writeHead(200, { 'Content-Type': 'text/plain' });
-            res.end("Proxy is Running!");
+        // Tentar rota sem token: /{live|movie|series}/user/pass/id.ext com origem conhecida
+        const m = reqUrl.pathname.match(/^\/(live|movie|series)\/([^/]+)\/([^/]+)\/([^/.]+)\.(ts|m3u8|mp4|mkv)$/);
+        if (m && (ORIGIN_BASE || reqUrl.searchParams.get('up'))) {
+            const kind = m[1];
+            username = decodeURIComponent(m[2]);
+            password = decodeURIComponent(m[3]);
+            const id = decodeURIComponent(m[4]);
+            const ext = m[5];
+            const base = (reqUrl.searchParams.get('up') || ORIGIN_BASE).replace(/\/+$/,'');
+            targetUrl = `${base}/${kind}/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${encodeURIComponent(id)}.${ext}`;
+        } else {
+            // --- Página Inicial/Health ---
+            if (reqUrl.pathname === '/' || reqUrl.pathname === '/api' || reqUrl.pathname === '/health') {
+                res.writeHead(200, { 'Content-Type': 'text/plain' });
+                res.end("Proxy is Running!");
+                return;
+            }
+            // Sem token e sem rota suportada
+            res.writeHead(404);
+            res.end();
             return;
         }
-        // ----------------------------------------
-
-        res.writeHead(404);
-        res.end();
-        return;
     }
 
     // 2. Decodificar Payload
-    let targetUrl, username, password;
-    try {
-        const decoded = Buffer.from(payload, 'base64').toString('binary');
-        let result = "";
-        for (let i = 0; i < decoded.length; i++) {
-            result += String.fromCharCode(decoded.charCodeAt(i) ^ SECRET_KEY.charCodeAt(i % SECRET_KEY.length));
+    if (payload) {
+        try {
+            const decoded = Buffer.from(payload, 'base64').toString('binary');
+            let result = "";
+            for (let i = 0; i < decoded.length; i++) {
+                result += String.fromCharCode(decoded.charCodeAt(i) ^ SECRET_KEY.charCodeAt(i % SECRET_KEY.length));
+            }
+            const parts = result.split('|'); // Formato: URL|USERNAME|PASSWORD
+            targetUrl = parts[0];
+            username = parts[1] || "";
+            password = parts[2] || "";
+        } catch (e) {
+            console.error(`[ERROR] Falha ao decodificar payload: ${e.message}`);
+            res.writeHead(400);
+            res.end("Bad Payload");
+            return;
         }
-        
-        // Formato esperado: URL|USERNAME|PASSWORD
-        const parts = result.split('|');
-        targetUrl = parts[0];
-        username = parts[1] || "";
-        password = parts[2] || "";
-        
-    } catch (e) {
-        console.error(`[ERROR] Falha ao decodificar payload: ${e.message}`);
-        res.writeHead(400);
-        res.end("Bad Payload");
-        return;
     }
 
     if (!targetUrl || !targetUrl.startsWith('http')) {
@@ -87,7 +102,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // B. Autenticação Remota (Check User/Pass no Painel)
-    const authUrlStr = reqUrl.searchParams.get("auth");
+    let authUrlStr = reqUrl.searchParams.get("auth");
     let connectionId = 0;
     let didStream = false;
     let terminate = false;
@@ -108,9 +123,11 @@ const server = http.createServer(async (req, res) => {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 5000);
             
-            const authRes = await fetch(authTarget.toString(), {
-                signal: controller.signal
-            });
+            // Evitar chamar endpoints externos acidentalmente (ex.: origem /auth)
+            const hostAuth = authTarget.host;
+            const hostSelf = req.headers.host;
+            const safeAuth = (hostAuth === hostSelf) || /worker_auth\.php/i.test(authTarget.pathname);
+            const authRes = safeAuth ? await fetch(authTarget.toString(), { signal: controller.signal }) : { status: 200 };
             clearTimeout(timeoutId);
 
             if (authRes.status !== 200) {
@@ -182,6 +199,24 @@ const server = http.createServer(async (req, res) => {
         const seen = new Set();
         const base = new URL(playlistUrl);
         let targetDur = 6;
+        const now = () => Date.now();
+        const cacheGet = (k) => {
+            const v = segmentCache.get(k);
+            if (!v) return null;
+            if (now() - v.ts > SEG_CACHE_TTL) { segmentCache.delete(k); return null; }
+            return v.data;
+        };
+        const cacheSet = (k, buf) => {
+            try {
+                segmentCache.set(k, { data: buf, ts: now() });
+                // Evict if too large
+                if (segmentCache.size > SEG_CACHE_MAX) {
+                    // Remove oldest ~10
+                    let n = 0;
+                    for (const key of segmentCache.keys()) { segmentCache.delete(key); if (++n >= 10) break; }
+                }
+            } catch {}
+        };
         while (!stopped && !terminate) {
             // Kill check on each loop for fast termination
             try {
@@ -245,6 +280,14 @@ const server = http.createServer(async (req, res) => {
                 let redirected = false;
                 let segUrlStr = u.toString();
                 let refreshNow = false;
+                const cached = cacheGet(segUrlStr);
+                if (cached && !terminate && !stopped) {
+                    res.write(cached);
+                    didStream = true;
+                    seen.add(s);
+                    i += 1;
+                    continue;
+                }
                 // Start prefetch of next segment if available and not already in flight
                 const nextIdx = i + 1;
                 if (nextIdx < segs.length && !prefetchInFlight && !seen.has(segs[nextIdx])) {
@@ -336,6 +379,7 @@ const server = http.createServer(async (req, res) => {
                 if (prefetchBuffer && prefetchedUrl) {
                     res.write(prefetchBuffer);
                     didStream = true;
+                    cacheSet(prefetchedUrl, prefetchBuffer);
                     seen.add(segs[nextIdx]);
                     prefetchBuffer = null;
                     prefetchedUrl = null;
