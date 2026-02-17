@@ -6,6 +6,20 @@ const crypto = require('crypto');
 const PORT = process.env.PORT || 8880;
 const SECRET = process.env.PROXY_TOKEN_SECRET || 'w5p_proxy_secret_2026';
 
+function quickGet(urlStr) {
+    try {
+        const u = new URL(urlStr);
+        const lib = u.protocol === 'https:' ? https : http;
+        const req = lib.request(u, { method: 'GET', timeout: 1500 }, (r) => {
+            r.on('data', () => {});
+            r.on('end', () => {});
+        });
+        req.on('error', () => {});
+        req.on('timeout', () => { req.destroy(); });
+        req.end();
+    } catch (_) {}
+}
+
 function sendJson(res, status, obj) {
     const body = JSON.stringify(obj);
     res.writeHead(status, {
@@ -93,6 +107,11 @@ http.createServer((req, res) => {
         }
 
         const target = decoded.u;
+        const cid = decoded.cid ? parseInt(decoded.cid, 10) : 0;
+        const authUrl = typeof decoded.auth === 'string' ? decoded.auth : null;
+        const username = liveMatch[1];
+        const password = liveMatch[2];
+
         let upstreamUrl;
         try {
             upstreamUrl = new URL(target);
@@ -102,6 +121,13 @@ http.createServer((req, res) => {
         }
 
         const lib = upstreamUrl.protocol === 'https:' ? https : http;
+
+        let hbInterval = null;
+        if (cid > 0 && authUrl) {
+            const updateUrl = `${authUrl}?action=update&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
+            quickGet(updateUrl);
+            hbInterval = setInterval(() => quickGet(updateUrl), 20000);
+        }
 
         const headers = {};
         if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
@@ -119,6 +145,12 @@ http.createServer((req, res) => {
             respHeaders['Access-Control-Allow-Origin'] = '*';
             res.writeHead(upstreamRes.statusCode || 502, respHeaders);
             upstreamRes.pipe(res);
+            upstreamRes.on('close', () => {
+                if (cid > 0 && authUrl) {
+                    const delUrl = `${authUrl}?action=delete&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
+                    quickGet(delUrl);
+                }
+            });
         });
 
         upstreamReq.on('error', () => {
@@ -134,6 +166,19 @@ http.createServer((req, res) => {
 
         req.on('close', () => {
             if (!upstreamReq.destroyed) upstreamReq.destroy();
+            if (cid > 0 && authUrl) {
+                const delUrl = `${authUrl}?action=delete&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
+                quickGet(delUrl);
+                if (hbInterval) { clearInterval(hbInterval); hbInterval = null; }
+            }
+        });
+
+        res.on('close', () => {
+            if (cid > 0 && authUrl) {
+                const delUrl = `${authUrl}?action=delete&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
+                quickGet(delUrl);
+                if (hbInterval) { clearInterval(hbInterval); hbInterval = null; }
+            }
         });
 
         upstreamReq.end();
