@@ -1,15 +1,15 @@
 {
-  "name": "video-proxy",
+  "name": "vps-manager-proxy",
   "version": "1.0.0",
-  "description": "Video Proxy Server",
+  "description": "Proxy Server for VPS Manager",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "mysql2": "^3.9.0"
   },
   "engines": {
-    "node": "18.x"
+    "node": ">=18.0.0"
   }
 }
