@@ -89,6 +89,11 @@ const server = http.createServer(async (req, res) => {
 
     // 4. Proxy Request
     const target = new URL(targetUrl);
+    
+    // SPOOF USER-AGENT: Force VLC User-Agent to upstream to avoid blocks
+    // This makes IBO Player look like VLC to the provider.
+    const spoofedUA = 'VLC/3.0.18 LibVLC/3.0.18';
+
     const options = {
         hostname: target.hostname,
         port: target.port || (target.protocol === 'https:' ? 443 : 80),
@@ -97,11 +102,11 @@ const server = http.createServer(async (req, res) => {
         headers: {
             ...req.headers,
             'Host': target.host,
-            'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': spoofedUA // <--- AQUI ESTÁ A MÁGICA
         },
         // --- FIXES FOR SOCKET HANG UP ---
-        rejectUnauthorized: false, // Ignore SSL errors (self-signed certs)
-        family: 4 // Force IPv4 (some providers block IPv6)
+        rejectUnauthorized: false, // Ignore SSL errors
+        family: 4 // Force IPv4
     };
     
     // Remove headers that might cause issues
