@@ -50,6 +50,7 @@ http.createServer((req, res) => {
         headers['Accept'] = '*/*';
         if (req.headers['range']) headers['Range'] = req.headers['range'];
         headers['Host'] = upstreamUrl.host;
+        headers['X-From-Proxy'] = '1';
 
         const upstreamReq = lib.request(upstreamUrl, {
             method: 'GET',
