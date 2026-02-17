@@ -1,8 +1,10 @@
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8880;
+const SECRET = process.env.PROXY_TOKEN_SECRET || 'w5p_proxy_secret_2026';
 
 function sendJson(res, status, obj) {
     const body = JSON.stringify(obj);
@@ -11,6 +13,49 @@ function sendJson(res, status, obj) {
         'Access-Control-Allow-Origin': '*'
     });
     res.end(body);
+}
+
+function base64urlEncode(buf) {
+    return buf.toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function base64urlDecode(str) {
+    let s = str.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    return Buffer.from(s, 'base64');
+}
+
+function decodeToken(token) {
+    if (!token || typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const payloadB64 = parts[0];
+    const sigB64 = parts[1];
+    let expected;
+    try {
+        const hmac = crypto.createHmac('sha256', SECRET);
+        hmac.update(payloadB64);
+        expected = base64urlEncode(hmac.digest());
+    } catch (e) {
+        return null;
+    }
+    const a = Buffer.from(sigB64);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length) return null;
+    if (!crypto.timingSafeEqual(a, b)) return null;
+    let json;
+    try {
+        const buf = base64urlDecode(payloadB64);
+        json = JSON.parse(buf.toString('utf8'));
+    } catch (e) {
+        return null;
+    }
+    if (!json || typeof json.u !== 'string') return null;
+    if (json.exp && typeof json.exp === 'number') {
+        const now = Math.floor(Date.now() / 1000);
+        if (now > json.exp) return null;
+    }
+    return json;
 }
 
 http.createServer((req, res) => {
@@ -29,20 +74,33 @@ http.createServer((req, res) => {
             return;
         }
 
-        // Health check só em /health
         if (url.pathname === '/health') {
             sendJson(res, 200, { status: 'online' });
             return;
         }
 
-        // Proxy: precisa ter ?url=
-        const target = url.searchParams.get('url');
-        if (!target) {
-            sendJson(res, 400, { error: 'missing_url' });
+        const liveMatch = url.pathname.match(/^\/live\/([^/]+)\/([^/]+)\/([^/.]+)\.(ts|m3u8)$/i);
+        if (!liveMatch) {
+            sendJson(res, 400, { error: 'invalid_path' });
             return;
         }
 
-        const upstreamUrl = new URL(target);
+        const token = url.searchParams.get('token');
+        const decoded = decodeToken(token);
+        if (!decoded) {
+            sendJson(res, 400, { error: 'invalid_token' });
+            return;
+        }
+
+        const target = decoded.u;
+        let upstreamUrl;
+        try {
+            upstreamUrl = new URL(target);
+        } catch (e) {
+            sendJson(res, 400, { error: 'bad_upstream_url' });
+            return;
+        }
+
         const lib = upstreamUrl.protocol === 'https:' ? https : http;
 
         const headers = {};
@@ -63,7 +121,7 @@ http.createServer((req, res) => {
             upstreamRes.pipe(res);
         });
 
-        upstreamReq.on('error', err => {
+        upstreamReq.on('error', () => {
             if (!res.headersSent) {
                 res.writeHead(502, { 'Content-Type': 'text/plain' });
                 res.end('Proxy Error');
