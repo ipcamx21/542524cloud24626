@@ -5,8 +5,8 @@ const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 
 // --- CONFIGURATION ---
-const SECRET_KEY = "VpsManagerStrongKey";
-const HTTP_PORT = process.env.PORT || 8000;
+const SECRET_KEY = "VpsManagerStrongKey"; // Must match PHP
+const HTTP_PORT = process.env.PORT || 8000; // Proxy Port
 const DB_CONFIG = {
     host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER || 'vps_user',
@@ -17,8 +17,12 @@ const DB_CONFIG = {
     queueLimit: 0
 };
 
+// --- DATABASE POOL ---
+const pool = mysql.createPool(DB_CONFIG);
+
 // --- HTTP SERVER ---
 const server = http.createServer(async (req, res) => {
+    // 1. CORS for Web Players
     if (req.method === 'OPTIONS') {
         res.writeHead(204, {
             'Access-Control-Allow-Origin': '*',
@@ -42,6 +46,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // 2. Validate Token
     if (Date.now() / 1000 > parseInt(expires)) {
         res.writeHead(403);
         res.end("Token Expired");
@@ -58,7 +63,8 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    let targetUrl;
+    // 3. Decode Payload
+    let targetUrl, username, password;
     try {
         const decoded = Buffer.from(payload, 'base64').toString('binary');
         let result = "";
@@ -67,6 +73,8 @@ const server = http.createServer(async (req, res) => {
         }
         const parts = result.split('|');
         targetUrl = parts[0];
+        username = parts[1];
+        password = parts[2];
     } catch (e) {
         res.writeHead(400);
         res.end("Invalid Payload");
@@ -79,11 +87,88 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // 4. Proxy Request
     const target = new URL(targetUrl);
     
-    // --- CAMUFLAGEM VLC ---
-    const spoofedUA = 'VLC/3.0.18 LibVLC/3.0.18';
+    // --- CAMUFLAGEM USER-AGENT ---
+    const spoofedUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
+    // --- LÓGICA DE EXTRAÇÃO M3U8 (NODE.JS) ---
+    // Se a URL original for M3U8 ou o payload indicar isso, tentamos extrair o TS primeiro.
+    const isM3U8 = targetUrl.includes(".m3u8") || targetUrl.includes(".m3u");
+    
+    if (isM3U8) {
+        // Tenta baixar o m3u8 primeiro para extrair o TS
+        const m3uOptions = {
+            hostname: target.hostname,
+            port: target.port || (target.protocol === 'https:' ? 443 : 80),
+            path: target.pathname + target.search,
+            method: 'GET',
+            headers: {
+                'Host': target.host,
+                'User-Agent': spoofedUA,
+                'Accept': '*/*'
+            },
+            rejectUnauthorized: false,
+            family: 4
+        };
+
+        const m3uReq = (target.protocol === 'https:' ? https : http).request(m3uOptions, (m3uRes) => {
+            let data = '';
+            m3uRes.on('data', (chunk) => data += chunk);
+            m3uRes.on('end', () => {
+                if (data.includes("#EXTM3U")) {
+                    const lines = data.split('\n');
+                    let tsUrl = "";
+                    for (let line of lines) {
+                        line = line.trim();
+                        if (line && !line.startsWith("#")) {
+                            tsUrl = line;
+                            break;
+                        }
+                    }
+
+                    if (tsUrl) {
+                        // Resolver URL relativa
+                        if (!tsUrl.startsWith("http")) {
+                            const base = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+                            try {
+                                tsUrl = new URL(tsUrl, base).href;
+                            } catch (e) {
+                                // Fallback manual se URL falhar
+                                if (tsUrl.startsWith('/')) {
+                                    tsUrl = target.origin + tsUrl;
+                                } else {
+                                    tsUrl = base + tsUrl;
+                                }
+                            }
+                        }
+                        
+                        // Agora fazemos o proxy do TS REAL
+                        const tsTarget = new URL(tsUrl);
+                        proxyRequest(tsTarget, req, res, spoofedUA);
+                        return;
+                    }
+                }
+                // Se falhar na extração, faz proxy da URL original
+                proxyRequest(target, req, res, spoofedUA);
+            });
+        });
+        
+        m3uReq.on('error', () => {
+            // Se der erro ao baixar m3u8, tenta proxy direto
+            proxyRequest(target, req, res, spoofedUA);
+        });
+        
+        m3uReq.end();
+        return;
+    }
+
+    // Se não for M3U8, proxy direto
+    proxyRequest(target, req, res, spoofedUA);
+});
+
+function proxyRequest(target, req, res, ua) {
     const options = {
         hostname: target.hostname,
         port: target.port || (target.protocol === 'https:' ? 443 : 80),
@@ -92,14 +177,16 @@ const server = http.createServer(async (req, res) => {
         headers: {
             ...req.headers,
             'Host': target.host,
-            'User-Agent': spoofedUA // FINGE SER VLC
+            'User-Agent': ua,
+            'Accept': '*/*',
+            'Connection': 'keep-alive'
         },
         rejectUnauthorized: false, 
         family: 4 
     };
     
     delete options.headers['host'];
-    delete options.headers['connection']; 
+    delete options.headers['connection'];
 
     const proxyReq = (target.protocol === 'https:' ? https : http).request(options, (proxyRes) => {
         const headers = { ...proxyRes.headers };
@@ -114,7 +201,7 @@ const server = http.createServer(async (req, res) => {
 
     proxyReq.on('error', (e) => {
         if (!res.headersSent) {
-            console.error(`[PROXY ERROR] Target: ${targetUrl} | Error: ${e.message}`);
+            console.error(`[PROXY ERROR] Target: ${target.href} | Error: ${e.message}`);
             res.writeHead(502);
             res.end(`Proxy Connection Error: ${e.message}`);
         }
@@ -122,12 +209,12 @@ const server = http.createServer(async (req, res) => {
 
     req.on('close', () => {
         if (proxyReq) {
-            proxyReq.destroy(); 
+            proxyReq.destroy();
         }
     });
 
     req.pipe(proxyReq);
-});
+}
 
 server.listen(HTTP_PORT, () => {
     console.log(`Proxy Server running on port ${HTTP_PORT}`);
