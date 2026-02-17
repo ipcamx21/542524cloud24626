@@ -29,11 +29,13 @@ http.createServer((req, res) => {
             return;
         }
 
-        if (url.pathname === '/' || url.pathname === '/health') {
+        // Health check só em /health
+        if (url.pathname === '/health') {
             sendJson(res, 200, { status: 'online' });
             return;
         }
 
+        // Proxy: precisa ter ?url=
         const target = url.searchParams.get('url');
         if (!target) {
             sendJson(res, 400, { error: 'missing_url' });
