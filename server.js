@@ -11,6 +11,7 @@ function quickGet(urlStr) {
         const u = new URL(urlStr);
         const lib = u.protocol === 'https:' ? https : http;
         const req = lib.request(u, { method: 'GET', timeout: 1500 }, (r) => {
+            // drain and ignore
             r.on('data', () => {});
             r.on('end', () => {});
         });
@@ -111,7 +112,6 @@ http.createServer((req, res) => {
         const authUrl = typeof decoded.auth === 'string' ? decoded.auth : null;
         const username = liveMatch[1];
         const password = liveMatch[2];
-
         let upstreamUrl;
         try {
             upstreamUrl = new URL(target);
@@ -120,8 +120,6 @@ http.createServer((req, res) => {
             return;
         }
 
-        const lib = upstreamUrl.protocol === 'https:' ? https : http;
-
         let hbInterval = null;
         if (cid > 0 && authUrl) {
             const updateUrl = `${authUrl}?action=update&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
@@ -129,40 +127,65 @@ http.createServer((req, res) => {
             hbInterval = setInterval(() => quickGet(updateUrl), 20000);
         }
 
-        const headers = {};
-        if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
-        else headers['User-Agent'] = 'Mozilla/5.0';
-        headers['Accept'] = '*/*';
-        if (req.headers['range']) headers['Range'] = req.headers['range'];
-        headers['Host'] = upstreamUrl.host;
+        let upstreamReq;
 
-        const upstreamReq = lib.request(upstreamUrl, {
-            method: 'GET',
-            headers,
-            timeout: 60000
-        }, upstreamRes => {
-            const respHeaders = Object.assign({}, upstreamRes.headers);
-            respHeaders['Access-Control-Allow-Origin'] = '*';
-            res.writeHead(upstreamRes.statusCode || 502, respHeaders);
-            upstreamRes.pipe(res);
-            upstreamRes.on('close', () => {
-                if (cid > 0 && authUrl) {
-                    const delUrl = `${authUrl}?action=delete&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
-                    quickGet(delUrl);
+        function startRequest(currentUrl, redirectCount) {
+            const lib = currentUrl.protocol === 'https:' ? https : http;
+            const headers = {};
+            if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
+            else headers['User-Agent'] = 'Mozilla/5.0';
+            headers['Accept'] = '*/*';
+            if (req.headers['range']) headers['Range'] = req.headers['range'];
+            headers['Host'] = currentUrl.host;
+
+            upstreamReq = lib.request(currentUrl, {
+                method: 'GET',
+                headers,
+                timeout: 60000
+            }, upstreamRes => {
+                const statusCode = upstreamRes.statusCode || 0;
+                if (statusCode >= 300 && statusCode < 400 && upstreamRes.headers.location && redirectCount < 5) {
+                    let nextUrl;
+                    try {
+                        nextUrl = new URL(upstreamRes.headers.location, currentUrl);
+                    } catch (e) {
+                        if (!res.headersSent) {
+                            res.writeHead(502, { 'Content-Type': 'text/plain' });
+                            res.end('Bad redirect');
+                        }
+                        return;
+                    }
+                    upstreamRes.resume();
+                    startRequest(nextUrl, redirectCount + 1);
+                    return;
+                }
+                const respHeaders = Object.assign({}, upstreamRes.headers);
+                respHeaders['Access-Control-Allow-Origin'] = '*';
+                res.writeHead(statusCode || 502, respHeaders);
+                upstreamRes.pipe(res);
+                upstreamRes.on('close', () => {
+                    if (cid > 0 && authUrl) {
+                        const delUrl = `${authUrl}?action=delete&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
+                        quickGet(delUrl);
+                    }
+                });
+            });
+
+            upstreamReq.on('error', () => {
+                if (!res.headersSent) {
+                    res.writeHead(502, { 'Content-Type': 'text/plain' });
+                    res.end('Proxy Error');
                 }
             });
-        });
 
-        upstreamReq.on('error', () => {
-            if (!res.headersSent) {
-                res.writeHead(502, { 'Content-Type': 'text/plain' });
-                res.end('Proxy Error');
-            }
-        });
+            upstreamReq.on('timeout', () => {
+                upstreamReq.destroy();
+            });
 
-        upstreamReq.on('timeout', () => {
-            upstreamReq.destroy();
-        });
+            upstreamReq.end();
+        }
+
+        startRequest(upstreamUrl, 0);
 
         req.on('close', () => {
             if (!upstreamReq.destroyed) upstreamReq.destroy();
@@ -180,8 +203,6 @@ http.createServer((req, res) => {
                 if (hbInterval) { clearInterval(hbInterval); hbInterval = null; }
             }
         });
-
-        upstreamReq.end();
     } catch (e) {
         if (!res.headersSent) {
             res.writeHead(500, { 'Content-Type': 'text/plain' });
