@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 const SECRET_KEY = "VpsManagerStrongKey";
 
 // ==========================================
-// SISTEMA DE BROADCAST (DEDUPLICAÇÃO BLINDADA)
+// MODO SMART: DEDUPLICAÇÃO DE CONEXÃO
 // ==========================================
 const activeBroadcasts = new Map();
 
@@ -22,60 +22,55 @@ class SecureBroadcaster extends EventEmitter {
         this.headers = null;
         this.statusCode = null;
         this.upstreamReq = null;
-        this.retryCount = 0;
         
-        this.connect();
+        this.connect(this.url);
     }
 
-    connect() {
-        console.log(`[CDN] Iniciando Nova Transmissão: ${this.url}`);
-        const targetUrl = parse(this.url);
+    connect(currentUrl, redirects = 0) {
+        if (redirects > 5) {
+            this.emit('error', new Error('Muitos Redirects na Origem'));
+            this.destroy();
+            return;
+        }
+
+        console.log(`[CDN] Conectando Origem: ${currentUrl}`);
+        const targetUrl = parse(currentUrl);
         const lib = targetUrl.protocol === 'https:' ? https : http;
 
-        this.upstreamReq = lib.request(this.url, {
+        this.upstreamReq = lib.request(currentUrl, {
             method: 'GET',
             headers: {
                 'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18',
                 'Accept': '*/*'
             }
         }, (res) => {
-            // Se for Redirect, aborta o modo Smart (deixa o cliente tentar direto)
-            if ([301, 302, 303, 307].includes(res.statusCode)) {
-                this.emit('error', new Error('Redirect'));
-                this.destroy();
+            // SE A ORIGEM MANDAR REDIRECT, NÓS SEGUIMOS (O CLIENTE NÃO VÊ!)
+            if ([301, 302, 303, 307].includes(res.statusCode) && res.headers.location) {
+                console.log(`[CDN] Seguindo Redirect Interno...`);
+                const nextUrl = new URL(res.headers.location, currentUrl).toString();
+                this.upstreamReq.destroy(); // Fecha a antiga
+                this.connect(nextUrl, redirects + 1); // Abre a nova
                 return;
             }
 
             this.headers = res.headers;
             this.statusCode = res.statusCode;
-
-            // Avisa quem estava esperando
             this.emit('ready', { headers: this.headers, statusCode: this.statusCode });
 
             res.on('data', (chunk) => {
-                // Distribui para todos os clientes conectados
                 for (const client of this.clients) {
                     try {
-                        // Se o cliente já fechou ou está cheio, ignora para não travar os outros
-                        if (!client.writableEnded && !client.destroyed) {
-                            client.write(chunk);
-                        }
-                    } catch (e) {
-                        console.error("[CDN] Erro ao enviar para cliente:", e.message);
-                        this.removeClient(client);
-                    }
+                        if (!client.writableEnded && !client.destroyed) client.write(chunk);
+                    } catch (e) { this.removeClient(client); }
                 }
             });
 
             res.on('end', () => this.destroy());
-            res.on('error', (e) => {
-                console.error("[CDN] Erro na Origem (Res):", e.message);
-                this.destroy();
-            });
+            res.on('error', () => this.destroy());
         });
 
         this.upstreamReq.on('error', (err) => {
-            console.error(`[CDN] Erro na Conexão Origem: ${err.message}`);
+            console.error(`[CDN] Erro Origem: ${err.message}`);
             this.destroy();
         });
 
@@ -84,16 +79,9 @@ class SecureBroadcaster extends EventEmitter {
 
     addClient(res) {
         this.clients.add(res);
+        if (this.headers) this.initClient(res);
+        else this.once('ready', () => this.initClient(res));
         
-        // Se já temos headers, envia agora
-        if (this.headers) {
-            this.initClient(res);
-        } else {
-            // Se não, espera ficar pronto
-            this.once('ready', () => this.initClient(res));
-        }
-
-        // Limpeza automática se o cliente sair
         res.on('close', () => this.removeClient(res));
         res.on('error', () => this.removeClient(res));
     }
@@ -103,24 +91,13 @@ class SecureBroadcaster extends EventEmitter {
             this.clients.delete(res);
             if (!res.writableEnded) res.end();
         }
-        
-        // Se zero clientes, fecha a conexão com a origem para economizar
-        if (this.clients.size === 0) {
-            console.log(`[CDN] Zero espectadores. Encerrando transmissão: ${this.url}`);
-            this.destroy();
-        }
+        if (this.clients.size === 0) this.destroy();
     }
 
     initClient(res) {
         if (res.headersSent) return;
-        
-        // Copia headers essenciais da origem
         if (this.headers['content-type']) res.setHeader('Content-Type', this.headers['content-type']);
-        
-        // CORS e Configurações de Stream
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Connection', 'keep-alive');
-        
         res.writeHead(this.statusCode || 200);
     }
 
@@ -130,10 +107,7 @@ class SecureBroadcaster extends EventEmitter {
             this.upstreamReq.destroy();
             this.upstreamReq = null;
         }
-        // Encerra todos os clientes suavemente
-        this.clients.forEach(client => {
-            if (!client.writableEnded) client.end();
-        });
+        this.clients.forEach(c => !c.writableEnded && c.end());
         this.clients.clear();
     }
 }
@@ -142,63 +116,50 @@ class SecureBroadcaster extends EventEmitter {
 // ROTA PRINCIPAL
 // ==========================================
 app.get('/api', (req, res) => {
-    // 1. Configurações de CORS
+    // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, User-Agent, Authorization');
-
     if (req.method === 'OPTIONS') return res.status(200).end();
 
+    // Validação Token
     const { payload, expires, token, auth } = req.query;
-
-    // 2. Validações
-    if (!payload || !expires || !token) return res.status(403).send("Erro: Parametros ausentes");
-    if (Date.now() / 1000 > parseInt(expires)) return res.status(403).send("Erro: Token expirado");
-
+    if (!payload || !expires || !token) return res.status(403).send("Erro");
+    if (Date.now() / 1000 > parseInt(expires)) return res.status(403).send("Exp");
+    
     const hmac = crypto.createHmac('sha256', SECRET_KEY);
     hmac.update(payload + expires + (auth || ''));
-    if (token !== hmac.digest('hex')) return res.status(403).send("Erro: Assinatura invalida");
+    if (token !== hmac.digest('hex')) return res.status(403).send("Inv");
 
-    // 3. Descriptografar URL
+    // Decrypt URL
     let streamUrl;
     try {
         const decoded = Buffer.from(payload, 'base64').toString('binary');
         let output = '';
-        for (let i = 0; i < decoded.length; i++) {
-            output += String.fromCharCode(decoded.charCodeAt(i) ^ SECRET_KEY.charCodeAt(i % SECRET_KEY.length));
-        }
+        for (let i = 0; i < decoded.length; i++) output += String.fromCharCode(decoded.charCodeAt(i) ^ SECRET_KEY.charCodeAt(i % SECRET_KEY.length));
         streamUrl = output.split('|')[0];
-    } catch (e) {
-        return res.status(500).send("Erro: Falha na descriptografia");
-    }
+    } catch (e) { return res.status(500).send("Err Dec"); }
 
-    if (!streamUrl) return res.status(400).send("Erro: URL invalida");
+    if (!streamUrl) return res.status(400).send("Err URL");
 
-    // ==========================================
-    // LÓGICA DE DECISÃO: CACHE vs DIRETO
-    // ==========================================
-    
-    // Regra: Se pedir RANGE (pedaço) ou for VOD (arquivo fechado), VAI DIRETO.
-    // Isso evita travar filmes ou trocas rápidas.
+    // DECISÃO: MODO DIRETO (VOD/Range) ou MODO SMART (Live)
+    // Em ambos os casos, a conexão é feita PELO SERVIDOR (Proxy). O cliente NUNCA conecta direto.
     const isVOD = streamUrl.match(/\.(mp4|mkv|avi|mov)$/i);
     const hasRange = req.headers.range;
 
     if (hasRange || isVOD) {
-        // MODO DIRETO (1 Cliente = 1 Conexão)
+        // Modo Proxy Direto (Sem Deduplicação, mas COM Proteção de Origem)
         proxyDirect(streamUrl, req, res);
     } else {
-        // MODO CACHE/DEDUPLICAÇÃO (1000 Clientes = 1 Conexão)
+        // Modo Smart (Com Deduplicação e Proteção de Origem)
         if (activeBroadcasts.has(streamUrl)) {
-            // Já existe? Entra na sala!
-            const broadcaster = activeBroadcasts.get(streamUrl);
-            broadcaster.addClient(res);
+            activeBroadcasts.get(streamUrl).addClient(res);
         } else {
-            // Não existe? Cria a sala!
             const broadcaster = new SecureBroadcaster(streamUrl);
             activeBroadcasts.set(streamUrl, broadcaster);
             broadcaster.addClient(res);
-
-            // Se der erro ao criar, tenta o modo direto como fallback
+            
+            // Fallback SEGURO (Se falhar, usa Proxy Direto, nunca Redirect)
             broadcaster.once('error', () => {
                 if (!res.headersSent) proxyDirect(streamUrl, req, res);
             });
@@ -206,8 +167,9 @@ app.get('/api', (req, res) => {
     }
 });
 
+// PROXY DIRETO (SEM REDIRECT PARA O CLIENTE)
 function proxyDirect(url, clientReq, clientRes, redirects = 0) {
-    if (redirects > 5) return clientRes.status(502).send("Loop Redirect");
+    if (redirects > 5) return clientRes.status(502).send("Loop");
 
     const targetUrl = parse(url);
     const lib = targetUrl.protocol === 'https:' ? https : http;
@@ -220,10 +182,13 @@ function proxyDirect(url, clientReq, clientRes, redirects = 0) {
             ...(clientReq.headers.range && { 'Range': clientReq.headers.range })
         }
     }, (proxyRes) => {
+        // SEGUIR REDIRECT INTERNAMENTE
         if ([301, 302, 303, 307].includes(proxyRes.statusCode) && proxyRes.headers.location) {
-            return proxyDirect(new URL(proxyRes.headers.location, url).toString(), clientReq, clientRes, redirects + 1);
+            const nextUrl = new URL(proxyRes.headers.location, url).toString();
+            return proxyDirect(nextUrl, clientReq, clientRes, redirects + 1);
         }
 
+        // Repassar conteúdo
         if (proxyRes.headers['content-type']) clientRes.setHeader('Content-Type', proxyRes.headers['content-type']);
         if (proxyRes.headers['content-length']) clientRes.setHeader('Content-Length', proxyRes.headers['content-length']);
         if (proxyRes.headers['accept-ranges']) clientRes.setHeader('Accept-Ranges', proxyRes.headers['accept-ranges']);
@@ -233,17 +198,9 @@ function proxyDirect(url, clientReq, clientRes, redirects = 0) {
         proxyRes.pipe(clientRes);
     });
 
-    proxyReq.on('error', (err) => {
-        if (!clientRes.headersSent) clientRes.status(502).send("Erro Proxy Direto");
-    });
-
+    proxyReq.on('error', () => !clientRes.headersSent && clientRes.status(502).send("Err Proxy"));
     proxyReq.end();
 }
 
-app.get('*', (req, res) => {
-    res.status(404).send(`<html><head><title>404 Not Found</title></head><body bgcolor="white"><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>`);
-});
-
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+app.get('*', (req, res) => res.status(404).send(`<html><head><title>404 Not Found</title></head><body bgcolor="white"><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
