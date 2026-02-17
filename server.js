@@ -3,7 +3,6 @@ const https = require('https');
 const { URL } = require('url');
 
 const PORT = process.env.PORT || 8880;
-const PANEL_BASE = process.env.PANEL_BASE || 'https://playagr.sbs';
 
 function sendJson(res, status, obj) {
     const body = JSON.stringify(obj);
@@ -35,13 +34,13 @@ http.createServer((req, res) => {
             return;
         }
 
-        const match = url.pathname.match(/^\/live\/([^/]+)\/([^/]+)\/([^\.]+)\.(ts|m3u8|mp4|mkv)$/i);
-        if (!match) {
-            sendJson(res, 404, { error: 'not_found' });
+        const target = url.searchParams.get('url');
+        if (!target) {
+            sendJson(res, 400, { error: 'missing_url' });
             return;
         }
 
-        const upstreamUrl = new URL(url.pathname + url.search, PANEL_BASE);
+        const upstreamUrl = new URL(target);
         const lib = upstreamUrl.protocol === 'https:' ? https : http;
 
         const headers = {};
@@ -50,7 +49,6 @@ http.createServer((req, res) => {
         headers['Accept'] = '*/*';
         if (req.headers['range']) headers['Range'] = req.headers['range'];
         headers['Host'] = upstreamUrl.host;
-        headers['X-From-Proxy'] = '1';
 
         const upstreamReq = lib.request(upstreamUrl, {
             method: 'GET',
