@@ -79,13 +79,21 @@ const server = http.createServer(async (req, res) => {
     }
 
     // B. Autenticação Remota (Check User/Pass no Painel)
-    const authUrl = reqUrl.searchParams.get("auth");
-    if (authUrl && username && password) {
+    const authUrlStr = reqUrl.searchParams.get("auth");
+    let connectionId = 0;
+
+    if (authUrlStr && username && password) {
         try {
-            const authTarget = new URL(authUrl);
+            const authTarget = new URL(authUrlStr);
             authTarget.searchParams.set("username", username);
             authTarget.searchParams.set("password", password);
+            authTarget.searchParams.set("action", "check"); // Check inicial
             
+            // Tenta extrair o CID da URL original
+            if (authTarget.searchParams.has('cid')) {
+                connectionId = authTarget.searchParams.get('cid');
+            }
+
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 5000);
             
@@ -100,6 +108,34 @@ const server = http.createServer(async (req, res) => {
                 res.end("Access Denied");
                 return;
             }
+
+            // --- HEARTBEAT & AUTO-DISCONNECT ---
+            // Se autenticou com sucesso, inicia o loop de "estou vivo"
+            if (connectionId > 0) {
+                const heartbeatInterval = setInterval(() => {
+                    // Envia 'update' a cada 30s
+                    const hbUrl = new URL(authUrlStr);
+                    hbUrl.searchParams.set("username", username);
+                    hbUrl.searchParams.set("password", password);
+                    hbUrl.searchParams.set("action", "update");
+                    
+                    fetch(hbUrl.toString()).catch(() => {}); // Fire and forget
+                }, 30000);
+
+                // Quando o cliente fecha a conexão (Troca de canal ou desliga TV)
+                res.on('close', () => {
+                    clearInterval(heartbeatInterval);
+                    console.log(`[DISCONNECT] Cliente saiu. Removendo conexão ${connectionId}...`);
+                    
+                    const delUrl = new URL(authUrlStr);
+                    delUrl.searchParams.set("username", username);
+                    delUrl.searchParams.set("password", password);
+                    delUrl.searchParams.set("action", "delete"); // DELETA DO PAINEL
+                    
+                    fetch(delUrl.toString()).catch(() => {});
+                });
+            }
+
         } catch (e) {
             console.error(`[AUTH ERROR] Falha ao contatar servidor de auth: ${e.message}`);
             res.writeHead(502);
@@ -112,7 +148,6 @@ const server = http.createServer(async (req, res) => {
 
     // 3. Proxy Puro (COM FOLLOW REDIRECTS)
     
-    // Função auxiliar para fazer o request seguindo redirects
     function doProxyRequest(currentUrl, redirectCount = 0) {
         if (redirectCount > 5) {
             console.error(`[ERROR] Muitos redirecionamentos para: ${targetUrl}`);
@@ -126,36 +161,40 @@ const server = http.createServer(async (req, res) => {
         const target = new URL(currentUrl);
         const lib = target.protocol === 'https:' ? https : http;
 
-        console.log(`[PROXY] Tentando stream (Redirect ${redirectCount}): ${currentUrl}`);
+        console.log(`[PROXY] Stream: ${currentUrl} (User: ${username})`);
 
         const proxyReq = lib.request(currentUrl, {
             method: req.method,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': '*/*'
             },
             rejectUnauthorized: false
         }, (proxyRes) => {
-            // Se for redirecionamento (301, 302, 307), seguir a nova URL
             if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
                 console.log(`[REDIRECT] Seguindo para: ${proxyRes.headers.location}`);
-                
-                // Consumir dados da resposta antiga para não vazar memória
                 proxyRes.resume();
-                
-                // Chamar recursivamente para a nova URL
                 doProxyRequest(proxyRes.headers.location, redirectCount + 1);
                 return;
             }
 
-            // Se não for redirect, é o conteúdo real (Stream)
-            // Copiar status e headers importantes de forma SEGURA
             const headers = {
                 'Access-Control-Allow-Origin': '*'
             };
             
+            // IBO PLAYER COMPATIBILITY FIX
+            // Força o Content-Type correto baseado na URL ou no que veio da origem
             if (proxyRes.headers['content-type']) {
                 headers['Content-Type'] = proxyRes.headers['content-type'];
+            }
+
+            // Se a URL termina em .m3u8, força tipo HLS (alguns players exigem)
+            if (currentUrl.includes('.m3u8') || targetUrl.includes('.m3u8')) {
+                headers['Content-Type'] = 'application/vnd.apple.mpegurl';
+            }
+            // Se termina em .ts, força MPEG-TS
+            else if (currentUrl.includes('.ts') || targetUrl.includes('.ts')) {
+                headers['Content-Type'] = 'video/mp2t';
             }
             
             res.writeHead(proxyRes.statusCode, headers);
@@ -178,8 +217,7 @@ const server = http.createServer(async (req, res) => {
         req.pipe(proxyReq);
     }
 
-    // Iniciar o processo
     doProxyRequest(targetUrl);
 });
 
-server.listen(PORT, () => console.log(`Proxy Authenticated + FollowRedirects running on ${PORT}`));
+server.listen(PORT, () => console.log(`Proxy (Auth+Heartbeat+IBOFix) running on ${PORT}`));
