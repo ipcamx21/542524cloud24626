@@ -109,7 +109,7 @@ const server = http.createServer(async (req, res) => {
                             }
                         } catch {}
                     })();
-                }, 30000);
+                }, 5000);
 
                 res.on('close', () => {
                     clearInterval(heartbeatInterval);
@@ -132,13 +132,30 @@ const server = http.createServer(async (req, res) => {
     }
 
     async function streamM3u8AsTs(playlistUrl) {
-        res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Access-Control-Allow-Origin': '*' });
+        res.writeHead(200, {
+            'Content-Type': 'video/mp2t',
+            'Access-Control-Allow-Origin': '*'
+        });
         let stopped = false;
         res.on('close', () => { stopped = true; });
         abortCurrentStream = () => { stopped = true; try { res.end(); } catch {} };
         const seen = new Set();
         const base = new URL(playlistUrl);
         while (!stopped && !terminate) {
+            try {
+                if (authUrlStr && connectionId > 0) {
+                    const kUrl = new URL(authUrlStr);
+                    kUrl.searchParams.set("username", username);
+                    kUrl.searchParams.set("password", password);
+                    kUrl.searchParams.set("action", "update");
+                    kUrl.searchParams.set("cid", connectionId);
+                    const kr = await fetch(kUrl.toString());
+                    if (!kr.ok) {
+                        terminate = true;
+                        break;
+                    }
+                }
+            } catch {}
             let text = "";
             try {
                 const controller = new AbortController();
@@ -166,7 +183,7 @@ const server = http.createServer(async (req, res) => {
                     const lib = u.protocol === 'https:' ? https : http;
                     const segmentReq = lib.get(u.toString(), {
                         headers: {
-                            'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+                            'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                             'Accept': '*/*'
                         },
                         rejectUnauthorized: false
@@ -217,7 +234,10 @@ const server = http.createServer(async (req, res) => {
             lines.push(segUrl.toString());
         }
         const playlist = lines.join("\n");
-        res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*' });
+        res.writeHead(200, {
+            'Content-Type': 'application/vnd.apple.mpegurl',
+            'Access-Control-Allow-Origin': '*'
+        });
         res.end(playlist);
         return;
     }
@@ -237,7 +257,7 @@ const server = http.createServer(async (req, res) => {
         const proxyReq = lib.request(currentUrl, {
             method: req.method,
             headers: {
-                'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+                'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': '*/*'
             },
             rejectUnauthorized: false
