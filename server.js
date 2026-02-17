@@ -5,8 +5,8 @@ const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 
 // --- CONFIGURATION ---
-const SECRET_KEY = "VpsManagerStrongKey"; // Must match PHP
-const HTTP_PORT = process.env.PORT || 8000; // Proxy Port
+const SECRET_KEY = "VpsManagerStrongKey";
+const HTTP_PORT = process.env.PORT || 8000;
 const DB_CONFIG = {
     host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER || 'vps_user',
@@ -17,12 +17,8 @@ const DB_CONFIG = {
     queueLimit: 0
 };
 
-// --- DATABASE POOL ---
-const pool = mysql.createPool(DB_CONFIG);
-
 // --- HTTP SERVER ---
 const server = http.createServer(async (req, res) => {
-    // 1. CORS for Web Players
     if (req.method === 'OPTIONS') {
         res.writeHead(204, {
             'Access-Control-Allow-Origin': '*',
@@ -46,7 +42,6 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // 2. Validate Token
     if (Date.now() / 1000 > parseInt(expires)) {
         res.writeHead(403);
         res.end("Token Expired");
@@ -63,8 +58,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // 3. Decode Payload
-    let targetUrl, username, password;
+    let targetUrl;
     try {
         const decoded = Buffer.from(payload, 'base64').toString('binary');
         let result = "";
@@ -73,8 +67,6 @@ const server = http.createServer(async (req, res) => {
         }
         const parts = result.split('|');
         targetUrl = parts[0];
-        username = parts[1];
-        password = parts[2];
     } catch (e) {
         res.writeHead(400);
         res.end("Invalid Payload");
@@ -87,11 +79,9 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // 4. Proxy Request
     const target = new URL(targetUrl);
     
-    // SPOOF USER-AGENT: Force VLC User-Agent to upstream to avoid blocks
-    // This makes IBO Player look like VLC to the provider.
+    // --- CAMUFLAGEM VLC ---
     const spoofedUA = 'VLC/3.0.18 LibVLC/3.0.18';
 
     const options = {
@@ -102,19 +92,16 @@ const server = http.createServer(async (req, res) => {
         headers: {
             ...req.headers,
             'Host': target.host,
-            'User-Agent': spoofedUA // <--- O SEGREDO ESTÁ AQUI
+            'User-Agent': spoofedUA // FINGE SER VLC
         },
-        // --- FIXES FOR SOCKET HANG UP ---
-        rejectUnauthorized: false, // Ignore SSL errors (self-signed certs)
-        family: 4 // Force IPv4 (some providers block IPv6)
+        rejectUnauthorized: false, 
+        family: 4 
     };
     
-    // Remove headers that might cause issues
     delete options.headers['host'];
     delete options.headers['connection']; 
 
     const proxyReq = (target.protocol === 'https:' ? https : http).request(options, (proxyRes) => {
-        // Forward Status
         const headers = { ...proxyRes.headers };
         headers['Access-Control-Allow-Origin'] = '*';
         headers['Access-Control-Expose-Headers'] = 'Content-Length, Content-Range, Content-Type';
@@ -133,14 +120,12 @@ const server = http.createServer(async (req, res) => {
         }
     });
 
-    // --- CRITICAL: HANDLE CLIENT DISCONNECT ---
     req.on('close', () => {
         if (proxyReq) {
-            proxyReq.destroy(); // Kill upstream connection immediately
+            proxyReq.destroy(); 
         }
     });
 
-    // Pipe Request Body (for POSTs)
     req.pipe(proxyReq);
 });
 
