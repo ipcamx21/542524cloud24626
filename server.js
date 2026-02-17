@@ -94,11 +94,12 @@ class SecureBroadcaster extends EventEmitter {
     }
 }
 
-app.get('/api', async (req, res) => {
+// ROTA GENÉRICA QUE PEGA /api/stream.m3u8, /api/stream.ts, etc.
+app.get('/api*', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     if (req.method === 'OPTIONS') return res.status(200).end();
 
-    const { payload, expires, token, auth, ext, mode } = req.query;
+    const { payload, expires, token, auth, mode } = req.query;
 
     if (!payload || !expires || !token) return res.status(403).send("E1");
     if (Date.now() / 1000 > parseInt(expires)) return res.status(403).send("E2");
@@ -126,27 +127,25 @@ app.get('/api', async (req, res) => {
     }
 
     // ==========================================
-    // WRAPPER M3U8 (COMPATIBILIDADE IBO PLAYER)
+    // DETECÇÃO POR CAMINHO FALSO (URL PATH)
     // ==========================================
-    // Se o player pediu .m3u8 OU o cabeçalho diz mpegurl, entregamos a playlist falsa
-    const accept = req.headers['accept'] || '';
-    const wantsM3U8 = (ext === 'm3u8' || req.url.includes('.m3u8') || accept.includes('mpegurl') || accept.includes('apple'));
-    
-    // Se quiser M3U8 e NÃO estiver no modo 'raw' (streaming direto)
-    if (wantsM3U8 && mode !== 'raw') {
-        // Gera URL apontando para si mesmo com mode=raw (para entregar o TS)
-        // Adicionamos ext=ts para garantir que caia no fluxo correto na próxima
-        const selfUrl = `${req.protocol}://${req.get('host')}${req.path}?${new URLSearchParams({...req.query, mode: 'raw', ext: 'ts'}).toString()}`;
+    const path = req.path;
+    const isM3U8 = path.endsWith('.m3u8');
+    const isTS = path.endsWith('.ts');
+
+    // Se a URL termina em .m3u8 e não é modo raw -> Manda Playlist
+    if (isM3U8 && mode !== 'raw') {
+        // Troca .m3u8 por .ts na URL
+        const tsPath = path.replace('.m3u8', '.ts');
+        const selfUrl = `${req.protocol}://${req.get('host')}${tsPath}?${new URLSearchParams({...req.query, mode: 'raw'}).toString()}`;
         
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.setHeader('Content-Disposition', 'inline; filename="stream.m3u8"');
-        
-        // FORMATO IDÊNTICO AO LIVE.PHP ORIGINAL
         return res.send(`#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:60\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:60.0,\n${selfUrl}`);
     }
 
     // ==========================================
-    // STREAMING (TS/VOD)
+    // STREAMING REAL (TS/VOD)
     // ==========================================
     const isVOD = streamUrl.match(/\.(mp4|mkv|avi|mov)$/i);
     const hasRange = req.headers.range;
