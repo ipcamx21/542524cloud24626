@@ -9,50 +9,33 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET_KEY = "VpsManagerStrongKey";
 
-// Cache de Autenticação (Para não sobrecarregar seu painel)
-// User+Pass -> { valid: true, expires: timestamp }
+// Cache de Autenticação (60 segundos)
 const authCache = new Map();
 
-// Função para validar usuário no seu Painel
 function validateUser(authUrl, username, password) {
     return new Promise((resolve) => {
         const cacheKey = `${username}:${password}`;
         const cached = authCache.get(cacheKey);
-        
-        // Se validou nos últimos 60 segundos, libera direto (Cache)
-        if (cached && cached.expires > Date.now()) {
-            return resolve(cached.valid);
-        }
+        if (cached && cached.expires > Date.now()) return resolve(cached.valid);
 
-        console.log(`[Auth] Verificando usuário: ${username}`);
-        
-        // Chama seu script PHP para validar
-        const targetUrl = new URL(authUrl);
-        targetUrl.searchParams.set('username', username);
-        targetUrl.searchParams.set('password', password); // O PHP deve aceitar hash ou raw
-
-        const lib = targetUrl.protocol === 'https:' ? https : http;
-        
-        const req = lib.request(targetUrl.toString(), { method: 'GET', timeout: 5000 }, (res) => {
-            if (res.statusCode === 200) {
-                // Sucesso! Guarda no cache por 60s
-                authCache.set(cacheKey, { valid: true, expires: Date.now() + 60000 });
-                resolve(true);
-            } else {
-                console.log(`[Auth] Falha: ${res.statusCode}`);
-                resolve(false);
-            }
-        });
-
-        req.on('error', () => resolve(false));
-        req.on('timeout', () => req.destroy());
-        req.end();
+        try {
+            const targetUrl = new URL(authUrl);
+            targetUrl.searchParams.set('username', username);
+            targetUrl.searchParams.set('password', password);
+            const lib = targetUrl.protocol === 'https:' ? https : http;
+            
+            const req = lib.request(targetUrl.toString(), { method: 'GET', timeout: 5000 }, (res) => {
+                const isValid = res.statusCode === 200;
+                if (isValid) authCache.set(cacheKey, { valid: true, expires: Date.now() + 60000 });
+                resolve(isValid);
+            });
+            req.on('error', () => resolve(false));
+            req.end();
+        } catch (e) { resolve(false); }
     });
 }
 
-// ==========================================
-// BROADCASTER (Mantido igual, mas agora protegido)
-// ==========================================
+// BROADCASTER BLINDADO
 const activeBroadcasts = new Map();
 
 class SecureBroadcaster extends EventEmitter {
@@ -67,7 +50,7 @@ class SecureBroadcaster extends EventEmitter {
     }
 
     connect(currentUrl, redirects = 0) {
-        if (redirects > 5) { this.emit('error', new Error('Loop')); this.destroy(); return; }
+        if (redirects > 5) { this.destroy(); return; }
         
         const targetUrl = parse(currentUrl);
         const lib = targetUrl.protocol === 'https:' ? https : http;
@@ -124,14 +107,14 @@ class SecureBroadcaster extends EventEmitter {
     }
 }
 
-// ==========================================
-// ROTA PRINCIPAL (COM AUTENTICAÇÃO)
-// ==========================================
+// ROTA PRINCIPAL
 app.get('/api', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     if (req.method === 'OPTIONS') return res.status(200).end();
 
-    const { payload, expires, token, auth } = req.query;
+    const { payload, expires, token, auth, mode } = req.query;
+
+    // 1. Validação Básica
     if (!payload || !expires || !token) return res.status(403).send("E1");
     if (Date.now() / 1000 > parseInt(expires)) return res.status(403).send("E2");
 
@@ -139,7 +122,7 @@ app.get('/api', async (req, res) => {
     hmac.update(payload + expires + (auth || ''));
     if (token !== hmac.digest('hex')) return res.status(403).send("E3");
 
-    // Descriptografar
+    // 2. Descriptografar
     let decodedString;
     try {
         const decoded = Buffer.from(payload, 'base64').toString('binary');
@@ -150,24 +133,30 @@ app.get('/api', async (req, res) => {
 
     const parts = decodedString.split('|');
     const streamUrl = parts[0];
-    const username = parts[1]; // Agora estamos lendo o user/pass do payload
+    const username = parts[1];
     const password = parts[2];
 
-    // ==========================================
-    // VALIDAÇÃO NO PAINEL (NOVA SEGURANÇA)
-    // ==========================================
+    // 3. Autenticação Remota (Opcional, mas recomendado)
     if (auth && username && password) {
         const isValid = await validateUser(auth, username, password);
-        if (!isValid) {
-            return res.status(403).send("Conta Bloqueada ou Expirada");
-        }
-    } else {
-        // Se não tiver authUrl (versões antigas), bloqueia ou libera?
-        // Melhor bloquear para forçar segurança.
-        // return res.status(403).send("Autenticacao Obrigatoria");
+        if (!isValid) return res.status(403).send("Bloqueado");
     }
 
-    // Se passou, libera o vídeo (Lógica Híbrida)
+    // 4. WRAPPER M3U8 (Se pedido via cabeçalho ou extensão .m3u8 na URL)
+    // Se o cliente pedir M3U8 mas o modo não for raw, entregamos a playlist falsa
+    const accept = req.headers['accept'] || '';
+    const wantsM3U8 = accept.includes('apple') || accept.includes('mpegurl') || req.url.includes('.m3u8');
+    
+    if (wantsM3U8 && mode !== 'raw') {
+        // Gera Playlist M3U8 Falsa apontando para si mesmo (Raw Mode)
+        const selfUrl = `${req.protocol}://${req.get('host')}${req.path}?${new URLSearchParams({...req.query, mode: 'raw'}).toString()}`;
+        
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.setHeader('Content-Disposition', 'inline; filename="stream.m3u8"');
+        return res.send(`#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:-1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:-1,Stream\n${selfUrl}`);
+    }
+
+    // 5. STREAMING REAL (Raw Mode)
     const isVOD = streamUrl.match(/\.(mp4|mkv|avi|mov)$/i);
     const hasRange = req.headers.range;
 
@@ -185,7 +174,6 @@ app.get('/api', async (req, res) => {
     }
 });
 
-// Proxy Direto (Fallback)
 function proxyDirect(url, clientReq, clientRes, redirects = 0) {
     if (redirects > 5) return clientRes.status(502).send("Loop");
     const targetUrl = parse(url);
