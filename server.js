@@ -2,14 +2,9 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const url = require('url');
-const EventEmitter = require('events');
 
 const SECRET_KEY = "VpsManagerStrongKey";
 const PORT = process.env.PORT || 8000;
-
-// --- DEDUPLICAÇÃO INTELIGENTE (Smart Restream) ---
-// Armazena streams ativos: { "url_do_canal": { response: ResponseObj, clients: [res1, res2], lastActivity: timestamp } }
-const activeStreams = new Map();
 
 const server = http.createServer((req, res) => {
     // 1. Validar Parâmetros Básicos
@@ -52,53 +47,11 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // --- LÓGICA DE DEDUPLICAÇÃO ---
-    // Se já existe uma conexão ativa para esse canal, reuse-a!
-    if (activeStreams.has(targetUrl)) {
-        console.log(`[CACHE HIT] Reutilizando stream para: ${targetUrl}`);
-        const stream = activeStreams.get(targetUrl);
-        
-        // Adiciona o novo cliente à lista
-        stream.clients.push(res);
-        
-        // Envia cabeçalhos imediatamente (se já disponíveis)
-        if (stream.headers) {
-            res.writeHead(stream.statusCode || 200, stream.headers);
-        }
-
-        // Lidar com desconexão do cliente
-        req.on('close', () => {
-            const index = stream.clients.indexOf(res);
-            if (index > -1) {
-                stream.clients.splice(index, 1);
-            }
-            console.log(`[CLIENT DISCONNECT] Cliente saiu de ${targetUrl}. Restantes: ${stream.clients.length}`);
-            
-            // Se não houver mais clientes, fecha a conexão com a origem
-            if (stream.clients.length === 0) {
-                console.log(`[STREAM STOP] Sem clientes para ${targetUrl}. Fechando origem.`);
-                if (stream.request) stream.request.destroy();
-                activeStreams.delete(targetUrl);
-            }
-        });
-        
-        return;
-    }
-
-    // --- NOVA CONEXÃO COM A ORIGEM ---
-    console.log(`[PROXY NEW] Abrindo nova conexão para: ${targetUrl}`);
-    
+    // 3. Proxy Puro (Pipe Direto)
     const target = new URL(targetUrl);
     const lib = target.protocol === 'https:' ? https : http;
 
-    const streamData = {
-        clients: [res],
-        headers: null,
-        statusCode: 200,
-        request: null
-    };
-    
-    activeStreams.set(targetUrl, streamData);
+    console.log(`[PROXY] ${targetUrl}`);
 
     const proxyReq = lib.request(targetUrl, {
         method: req.method,
@@ -108,69 +61,29 @@ const server = http.createServer((req, res) => {
         },
         rejectUnauthorized: false
     }, (proxyRes) => {
-        // Salva headers e status para novos clientes
+        // Copiar status e headers importantes de forma SEGURA
         const headers = {
             'Access-Control-Allow-Origin': '*'
         };
+        
+        // CORREÇÃO CRÍTICA: Só define Content-Type se ele existir na resposta original
+        // Isso evita o erro ERR_HTTP_INVALID_HEADER_VALUE que derrubava a máquina
         if (proxyRes.headers['content-type']) {
             headers['Content-Type'] = proxyRes.headers['content-type'];
         }
-        
-        streamData.headers = headers;
-        streamData.statusCode = proxyRes.statusCode;
 
-        // Envia headers para todos os clientes atuais (neste caso, apenas o primeiro)
-        streamData.clients.forEach(client => {
-            if (!client.headersSent) {
-                client.writeHead(proxyRes.statusCode, headers);
-            }
-        });
+        res.writeHead(proxyRes.statusCode, headers);
         
-        // Quando chegam dados, espalha para todos os clientes (BROADCAST)
-        proxyRes.on('data', (chunk) => {
-            streamData.clients.forEach(client => {
-                try {
-                    client.write(chunk);
-                } catch (e) {
-                    // Ignora erros de escrita (cliente caiu)
-                }
-            });
-        });
-
-        proxyRes.on('end', () => {
-            console.log(`[STREAM END] Fim da transmissão para: ${targetUrl}`);
-            streamData.clients.forEach(client => client.end());
-            activeStreams.delete(targetUrl);
-        });
+        proxyRes.pipe(res);
     });
 
     proxyReq.on('error', (err) => {
         console.error(`[ERROR] ${err.message}`);
-        streamData.clients.forEach(client => {
-            if (!client.headersSent) client.writeHead(502);
-            client.end();
-        });
-        activeStreams.delete(targetUrl);
-    });
-
-    streamData.request = proxyReq;
-
-    // Lidar com desconexão do PRIMEIRO cliente (criador da conexão)
-    req.on('close', () => {
-        const index = streamData.clients.indexOf(res);
-        if (index > -1) {
-            streamData.clients.splice(index, 1);
-        }
-        console.log(`[CLIENT DISCONNECT] Cliente (criador) saiu de ${targetUrl}. Restantes: ${streamData.clients.length}`);
-        
-        if (streamData.clients.length === 0) {
-            console.log(`[STREAM STOP] Sem clientes para ${targetUrl}. Fechando origem.`);
-            proxyReq.destroy();
-            activeStreams.delete(targetUrl);
-        }
+        if (!res.headersSent) res.writeHead(502);
+        res.end();
     });
 
     req.pipe(proxyReq);
 });
 
-server.listen(PORT, () => console.log(`Proxy Smart Restream running on ${PORT}`));
+server.listen(PORT, () => console.log(`Proxy Simple running on ${PORT}`));
