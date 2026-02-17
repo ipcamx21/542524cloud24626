@@ -42,31 +42,54 @@ function proxyRequest(target, req, res, ua) {
             'Host': target.host,
             'User-Agent': ua,
             'Accept': '*/*',
-            'Connection': 'keep-alive'
+            'Connection': 'keep-alive',
+            'Accept-Encoding': 'identity', // Avoid compression issues
+            'Referer': target.origin // Fake referer
         },
         rejectUnauthorized: false, 
-        family: 4 
+        family: 4,
+        timeout: 30000 // 30s connection timeout
     };
     
+    // Remove headers that reveal proxy
     delete options.headers['host'];
     delete options.headers['connection'];
+    delete options.headers['x-forwarded-for'];
+    delete options.headers['x-forwarded-proto'];
+    delete options.headers['x-forwarded-port'];
+    delete options.headers['via'];
+    delete options.headers['forwarded'];
+    delete options.headers['x-real-ip'];
 
     const proxyReq = (target.protocol === 'https:' ? https : http).request(options, (proxyRes) => {
         const headers = { ...proxyRes.headers };
         headers['Access-Control-Allow-Origin'] = '*';
         headers['Access-Control-Expose-Headers'] = 'Content-Length, Content-Range, Content-Type';
+        
+        // Remove security headers that might block embedding
         delete headers['content-security-policy'];
         delete headers['x-frame-options'];
+        delete headers['strict-transport-security'];
 
         res.writeHead(proxyRes.statusCode, headers);
         proxyRes.pipe(res);
     });
 
+    proxyReq.on('timeout', () => {
+        console.error(`[PROXY TIMEOUT] Target: ${target.href}`);
+        proxyReq.destroy();
+        if (!res.headersSent) {
+            res.writeHead(504);
+            res.end("Proxy Timeout");
+        }
+    });
+
     proxyReq.on('error', (e) => {
         if (!res.headersSent) {
-            console.error(`[PROXY ERROR] Target: ${target.href} | Error: ${e.message}`);
+            // Log full error details
+            console.error(`[PROXY ERROR] Target: ${target.href} | Code: ${e.code} | Syscall: ${e.syscall} | Message: ${e.message}`);
             res.writeHead(502);
-            res.end(`Proxy Connection Error: ${e.message}`);
+            res.end(`Proxy Connection Error: ${e.message} (${e.code})`);
         }
     });
 
@@ -128,7 +151,6 @@ const requestHandler = async (req, res) => {
     const authUrl = url.searchParams.get("auth");
 
     if (!payload || !expires || !token) {
-        // Se faltar parametros, mostra a pagina "Forbidden" (index.html) como disfarce
         fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
             if (err) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -203,10 +225,12 @@ const requestHandler = async (req, res) => {
             headers: {
                 'Host': target.host,
                 'User-Agent': spoofedUA,
-                'Accept': '*/*'
+                'Accept': '*/*',
+                'Referer': target.origin // Fake referer
             },
             rejectUnauthorized: false,
-            family: 4
+            family: 4,
+            timeout: 10000 // 10s timeout for m3u8 fetch
         };
 
         const m3uReq = (target.protocol === 'https:' ? https : http).request(m3uOptions, (m3uRes) => {
@@ -254,7 +278,13 @@ const requestHandler = async (req, res) => {
         });
         
         m3uReq.on('error', (e) => {
-            console.error(`[PROXY] Erro ao baixar M3U8: ${e.message}`);
+            console.error(`[PROXY] Erro ao baixar M3U8: ${e.message} (${e.code})`);
+            proxyRequest(target, req, res, spoofedUA);
+        });
+        
+        m3uReq.on('timeout', () => {
+            console.error(`[PROXY] Timeout ao baixar M3U8`);
+            m3uReq.destroy();
             proxyRequest(target, req, res, spoofedUA);
         });
         
