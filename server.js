@@ -64,6 +64,8 @@ const server = http.createServer(async (req, res) => {
     const authUrlStr = reqUrl.searchParams.get("auth");
     let connectionId = 0;
     let didStream = false;
+    let terminate = false;
+    let abortCurrentStream = () => {};
 
     if (authUrlStr && username && password) {
         try {
@@ -97,7 +99,16 @@ const server = http.createServer(async (req, res) => {
                     hbUrl.searchParams.set("password", password);
                     hbUrl.searchParams.set("action", "update");
                     hbUrl.searchParams.set("cid", connectionId);
-                    fetch(hbUrl.toString()).catch(() => {});
+                    (async () => {
+                        try {
+                            const r = await fetch(hbUrl.toString());
+                            if (!r.ok) {
+                                terminate = true;
+                                try { abortCurrentStream(); } catch {}
+                                try { res.end(); } catch {}
+                            }
+                        } catch {}
+                    })();
                 }, 30000);
 
                 res.on('close', () => {
@@ -121,15 +132,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     async function streamM3u8AsTs(playlistUrl) {
-        res.writeHead(200, {
-            'Content-Type': 'video/mp2t',
-            'Access-Control-Allow-Origin': '*'
-        });
+        res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Access-Control-Allow-Origin': '*' });
         let stopped = false;
         res.on('close', () => { stopped = true; });
+        abortCurrentStream = () => { stopped = true; try { res.end(); } catch {} };
         const seen = new Set();
         const base = new URL(playlistUrl);
-        while (!stopped) {
+        while (!stopped && !terminate) {
             let text = "";
             try {
                 const controller = new AbortController();
@@ -157,7 +166,7 @@ const server = http.createServer(async (req, res) => {
                     const lib = u.protocol === 'https:' ? https : http;
                     const segmentReq = lib.get(u.toString(), {
                         headers: {
-                            'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
                             'Accept': '*/*'
                         },
                         rejectUnauthorized: false
@@ -208,10 +217,7 @@ const server = http.createServer(async (req, res) => {
             lines.push(segUrl.toString());
         }
         const playlist = lines.join("\n");
-        res.writeHead(200, {
-            'Content-Type': 'application/vnd.apple.mpegurl',
-            'Access-Control-Allow-Origin': '*'
-        });
+        res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*' });
         res.end(playlist);
         return;
     }
@@ -231,7 +237,7 @@ const server = http.createServer(async (req, res) => {
         const proxyReq = lib.request(currentUrl, {
             method: req.method,
             headers: {
-                'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
                 'Accept': '*/*'
             },
             rejectUnauthorized: false
@@ -243,21 +249,16 @@ const server = http.createServer(async (req, res) => {
             }
 
             const headers = { 'Access-Control-Allow-Origin': '*' };
-
-            if (proxyRes.headers['content-type']) {
-                headers['Content-Type'] = proxyRes.headers['content-type'];
-            }
-
-            if (currentUrl.includes('.m3u8') || targetUrl.includes('.m3u8')) {
-                headers['Content-Type'] = 'application/vnd.apple.mpegurl';
-            } else if (currentUrl.includes('.ts') || targetUrl.includes('.ts') || currentUrl.includes('/mpegts') || targetUrl.includes('/mpegts')) {
-                headers['Content-Type'] = 'video/mp2t';
-            }
+            if (proxyRes.headers['content-type']) headers['Content-Type'] = proxyRes.headers['content-type'];
+            if (currentUrl.includes('.m3u8') || targetUrl.includes('.m3u8')) headers['Content-Type'] = 'application/vnd.apple.mpegurl';
+            else if (currentUrl.includes('.ts') || targetUrl.includes('.ts') || currentUrl.includes('/mpegts') || targetUrl.includes('/mpegts')) headers['Content-Type'] = 'video/mp2t';
 
             didStream = true;
             res.writeHead(proxyRes.statusCode, headers);
             proxyRes.pipe(res);
         });
+
+        abortCurrentStream = () => { try { proxyReq.destroy(); } catch {}; try { res.end(); } catch {} };
 
         proxyReq.on('error', (err) => {
             if (!res.headersSent) {
