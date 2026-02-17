@@ -63,6 +63,7 @@ const server = http.createServer(async (req, res) => {
 
     const authUrlStr = reqUrl.searchParams.get("auth");
     let connectionId = 0;
+    let didStream = false;
 
     if (authUrlStr && username && password) {
         try {
@@ -95,16 +96,20 @@ const server = http.createServer(async (req, res) => {
                     hbUrl.searchParams.set("username", username);
                     hbUrl.searchParams.set("password", password);
                     hbUrl.searchParams.set("action", "update");
+                    hbUrl.searchParams.set("cid", connectionId);
                     fetch(hbUrl.toString()).catch(() => {});
                 }, 30000);
 
                 res.on('close', () => {
                     clearInterval(heartbeatInterval);
-                    const delUrl = new URL(authUrlStr);
-                    delUrl.searchParams.set("username", username);
-                    delUrl.searchParams.set("password", password);
-                    delUrl.searchParams.set("action", "delete");
-                    fetch(delUrl.toString()).catch(() => {});
+                    if (didStream) {
+                        const delUrl = new URL(authUrlStr);
+                        delUrl.searchParams.set("username", username);
+                        delUrl.searchParams.set("password", password);
+                        delUrl.searchParams.set("action", "delete");
+                        delUrl.searchParams.set("cid", connectionId);
+                        fetch(delUrl.toString()).catch(() => {});
+                    }
                 });
             }
 
@@ -158,6 +163,7 @@ const server = http.createServer(async (req, res) => {
                         rejectUnauthorized: false
                     }, (segmentRes) => {
                         segmentRes.on('error', () => resolve());
+                        didStream = true;
                         segmentRes.pipe(res, { end: false });
                         segmentRes.on('end', () => resolve());
                     });
@@ -248,6 +254,7 @@ const server = http.createServer(async (req, res) => {
                 headers['Content-Type'] = 'video/mp2t';
             }
 
+            didStream = true;
             res.writeHead(proxyRes.statusCode, headers);
             proxyRes.pipe(res);
         });
