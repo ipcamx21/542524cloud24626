@@ -1,103 +1,51 @@
 const http = require('http');
 const https = require('https');
-const url = require('url');
+const { URL } = require('url');
 
-// --- CONFIGURAÇÃO ---
+// Porta do proxy (Koyeb / Render)
 const PORT = process.env.PORT || 8880;
-const ORIGIN_BASE = process.env.ORIGIN_BASE || "http://cdn474326.govods.online"; 
+
+// URL do SEU PAINEL (onde roda o live.php, movie.php, series.php)
+// Exemplo: http://playagr.sbs  (sem barra no final)
+// Esse valor NÃO é a fonte IPTV, é só o painel. As fontes continuam no script.
+const PANEL_URL = process.env.PANEL_URL || 'http://playagr.sbs';
 
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 500, keepAliveMsecs: 30000 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 500, keepAliveMsecs: 30000 });
 
-console.log(`Iniciando Proxy Leve na porta ${PORT}`);
-console.log(`Origem Base: ${ORIGIN_BASE}`);
+console.log(`Proxy ligado na porta ${PORT}`);
+console.log(`Painel de backend: ${PANEL_URL}`);
 
-http.createServer(async (req, res) => {
+http.createServer((req, res) => {
     try {
-        // Validação básica de URL
-        if (!req.url) {
-            res.writeHead(400);
-            res.end();
-            return;
-        }
-
-        // Health Check
-        if (req.url === '/' || req.url === '/health') {
-            res.writeHead(200, {'Content-Type': 'text/plain'});
+        if (!req.url || req.url === '/' || req.url === '/health') {
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
             res.end('Proxy Online');
             return;
         }
 
-        // Regex para capturar: /tipo/usuario/senha/id.ext
-        const regex = /^\/(live|movie|series)\/([^\/]+)\/([^\/]+)\/([^\.]+)\.(ts|m3u8|mp4|mkv|avi)$/i;
-        const urlParts = req.url.split('?');
-        const pathOnly = urlParts[0];
-        const match = pathOnly.match(regex);
+        // Aceita qualquer rota /live|/movie|/series exatamente como o painel
+        const backendUrl = new URL(req.url, PANEL_URL);
+        const lib = backendUrl.protocol === 'https:' ? https : http;
+        const agent = backendUrl.protocol === 'https:' ? httpsAgent : httpAgent;
 
-        if (!match) {
-            console.log(`[404] Rota invalida: ${req.url}`);
-            res.writeHead(404);
-            res.end('404 Not Found');
-            return;
-        }
+        // Marcar para o painel que o pedido veio da proxy (evitar loop de use_global_proxy)
+        const headers = {
+            ...req.headers,
+            host: backendUrl.host,
+            'x-from-proxy': '1'
+        };
 
-        // Verifica ORIGIN_BASE
-        let origin = ORIGIN_BASE;
-        const qParams = new URL(req.url, `http://localhost`).searchParams;
-        
-        // Se ORIGIN_BASE não estiver configurada ou for o placeholder, tenta pegar via ?up=
-        if (!origin || origin.includes("SEU_DNS_AQUI")) {
-            origin = qParams.get('up');
-            if (!origin) {
-                res.writeHead(500);
-                res.end('ERRO: Configure ORIGIN_BASE no servidor ou passe ?up=http://origem');
-                return;
-            }
-        }
-        
-        // Limpa barra final e garante http://
-        origin = origin.replace(/\/$/, '');
-        if (!origin.startsWith('http')) origin = 'http://' + origin;
+        console.log(`[PROXY] ${req.method} ${backendUrl.toString()}`);
 
-        // Monta URL de destino
-        const [, type, user, pass, id, ext] = match;
-        const targetUrl = `${origin}/${type}/${user}/${pass}/${id}.${ext}`;
-        
-        // Heartbeat Opcional (executa em background)
-        const authUrl = qParams.get('auth');
-        if (authUrl) {
-            performHeartbeat(authUrl, user, pass);
-        }
-
-        // Inicia Proxy
-        const targetObj = new url.URL(targetUrl);
-        const lib = targetObj.protocol === 'https:' ? https : http;
-        const agent = targetObj.protocol === 'https:' ? httpsAgent : httpAgent;
-
-        console.log(`[STREAM] ${user} -> ${id}.${ext}`);
-
-        const proxyReq = lib.request(targetUrl, {
-            method: 'GET',
-            headers: {
-                'User-Agent': req.headers['user-agent'] || 'VpsManagerProxy',
-                'Accept': '*/*',
-                'Connection': 'keep-alive',
-                'X-Forwarded-For': req.headers['x-forwarded-for'] || req.socket.remoteAddress
-            },
-            agent: agent,
+        const proxyReq = lib.request(backendUrl, {
+            method: req.method,
+            headers,
+            agent,
             timeout: 60000
         }, (proxyRes) => {
-            // Seguir Redirects (302/301)
-            if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
-                res.writeHead(proxyRes.statusCode, { 'Location': proxyRes.headers.location });
-                res.end();
-                return;
-            }
-
-            const headers = { ...proxyRes.headers };
-            headers['Access-Control-Allow-Origin'] = '*';
-            
-            res.writeHead(proxyRes.statusCode, headers);
+            const respHeaders = { ...proxyRes.headers, 'Access-Control-Allow-Origin': '*' };
+            res.writeHead(proxyRes.statusCode || 502, respHeaders);
             proxyRes.pipe(res);
         });
 
@@ -110,7 +58,7 @@ http.createServer(async (req, res) => {
         });
 
         proxyReq.on('timeout', () => {
-            console.error(`[TIMEOUT] Origem lenta: ${targetUrl}`);
+            console.error(`[TIMEOUT] Painel lento: ${backendUrl.toString()}`);
             proxyReq.destroy();
         });
 
@@ -118,26 +66,14 @@ http.createServer(async (req, res) => {
             if (!proxyReq.destroyed) proxyReq.destroy();
         });
 
-    } catch (error) {
-        console.error(`[CRITICAL] ${error.message}`);
+        req.pipe(proxyReq);
+    } catch (e) {
+        console.error(`[CRITICAL] ${e.message}`);
         if (!res.headersSent) {
             res.writeHead(500);
-            res.end('Internal Server Error');
+            res.end('Internal Error');
         }
     }
 }).listen(PORT, () => {
     console.log(`Servidor pronto na porta ${PORT}`);
 });
-
-function performHeartbeat(authUrl, user, pass) {
-    try {
-        const u = new URL(authUrl);
-        u.searchParams.set('username', user);
-        u.searchParams.set('password', pass);
-        u.searchParams.set('action', 'check');
-        const lib = u.protocol === 'https:' ? https : http;
-        const req = lib.request(u.toString(), { method: 'GET', timeout: 5000 }, (res) => { res.resume(); });
-        req.on('error', () => {});
-        req.end();
-    } catch (e) {}
-}
