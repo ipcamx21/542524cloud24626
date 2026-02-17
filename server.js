@@ -209,7 +209,8 @@ const server = http.createServer(async (req, res) => {
             }
         });
 
-        proxyReq.setTimeout(30000, () => {
+        // TIMEOUT AUMENTADO PARA 120s (2 MINUTOS)
+        proxyReq.setTimeout(120000, () => {
             console.error(`[TIMEOUT] Origem demorou muito para responder: ${currentUrl}`);
             proxyReq.destroy();
         });
