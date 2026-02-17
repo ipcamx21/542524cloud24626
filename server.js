@@ -8,7 +8,15 @@ const PORT = process.env.PORT || 8000;
 
 const server = http.createServer((req, res) => {
     // 1. Validar Parâmetros Básicos
-    const reqUrl = new URL(req.url, `http://${req.headers.host}`);
+    let reqUrl;
+    try {
+        reqUrl = new URL(req.url, `http://${req.headers.host}`);
+    } catch (e) {
+        res.writeHead(400);
+        res.end("Bad URL");
+        return;
+    }
+    
     const payload = reqUrl.searchParams.get("payload");
     
     // Ignorar requisições sem payload (robôs/scanners)
@@ -18,7 +26,7 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // 2. Decodificar Payload (Sem validação de token/tempo para teste de conectividade pura)
+    // 2. Decodificar Payload
     let targetUrl;
     try {
         const decoded = Buffer.from(payload, 'base64').toString('binary');
@@ -53,11 +61,18 @@ const server = http.createServer((req, res) => {
         },
         rejectUnauthorized: false
     }, (proxyRes) => {
-        // Copiar status e headers importantes
-        res.writeHead(proxyRes.statusCode, {
-            'Content-Type': proxyRes.headers['content-type'],
+        // Copiar status e headers importantes de forma SEGURA
+        const headers = {
             'Access-Control-Allow-Origin': '*'
-        });
+        };
+        
+        // CORREÇÃO CRÍTICA: Só define Content-Type se ele existir na resposta original
+        // Isso evita o erro ERR_HTTP_INVALID_HEADER_VALUE que derrubava a máquina
+        if (proxyRes.headers['content-type']) {
+            headers['Content-Type'] = proxyRes.headers['content-type'];
+        }
+
+        res.writeHead(proxyRes.statusCode, headers);
         
         proxyRes.pipe(res);
     });
