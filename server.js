@@ -10,12 +10,11 @@ const PORT = process.env.PORT || 3000;
 const SECRET_KEY = "VpsManagerStrongKey";
 
 // ==========================================
-// SMART RESTREAM ENGINE (HÍBRIDO)
+// SISTEMA DE BROADCAST (DEDUPLICAÇÃO BLINDADA)
 // ==========================================
-// Armazena apenas transmissões contínuas (Live TV)
-const activeStreams = new Map();
+const activeBroadcasts = new Map();
 
-class StreamBroadcaster extends EventEmitter {
+class SecureBroadcaster extends EventEmitter {
     constructor(url) {
         super();
         this.url = url;
@@ -23,13 +22,13 @@ class StreamBroadcaster extends EventEmitter {
         this.headers = null;
         this.statusCode = null;
         this.upstreamReq = null;
-        this.started = false;
+        this.retryCount = 0;
         
         this.connect();
     }
 
     connect() {
-        console.log(`[Smart Restream] Iniciando Conexão Mestre: ${this.url}`);
+        console.log(`[CDN] Iniciando Nova Transmissão: ${this.url}`);
         const targetUrl = parse(this.url);
         const lib = targetUrl.protocol === 'https:' ? https : http;
 
@@ -40,10 +39,8 @@ class StreamBroadcaster extends EventEmitter {
                 'Accept': '*/*'
             }
         }, (res) => {
-            // Se for redirecionamento, não podemos deduplicar facilmente aqui.
-            // O ideal seria seguir, mas para simplificar, vamos destruir e deixar o cliente tentar direto.
+            // Se for Redirect, aborta o modo Smart (deixa o cliente tentar direto)
             if ([301, 302, 303, 307].includes(res.statusCode)) {
-                console.log(`[Smart Restream] Redirect detectado. Abortando modo Smart.`);
                 this.emit('error', new Error('Redirect'));
                 this.destroy();
                 return;
@@ -51,24 +48,34 @@ class StreamBroadcaster extends EventEmitter {
 
             this.headers = res.headers;
             this.statusCode = res.statusCode;
-            this.started = true;
 
-            // Enviar headers para quem já estava esperando
-            this.clients.forEach(resClient => this.initClient(resClient));
+            // Avisa quem estava esperando
+            this.emit('ready', { headers: this.headers, statusCode: this.statusCode });
 
             res.on('data', (chunk) => {
-                // Transmitir para todos os clientes conectados
+                // Distribui para todos os clientes conectados
                 for (const client of this.clients) {
-                    client.write(chunk);
+                    try {
+                        // Se o cliente já fechou ou está cheio, ignora para não travar os outros
+                        if (!client.writableEnded && !client.destroyed) {
+                            client.write(chunk);
+                        }
+                    } catch (e) {
+                        console.error("[CDN] Erro ao enviar para cliente:", e.message);
+                        this.removeClient(client);
+                    }
                 }
             });
 
             res.on('end', () => this.destroy());
-            res.on('error', () => this.destroy());
+            res.on('error', (e) => {
+                console.error("[CDN] Erro na Origem (Res):", e.message);
+                this.destroy();
+            });
         });
 
         this.upstreamReq.on('error', (err) => {
-            console.error(`[Smart Restream] Erro na Origem: ${err.message}`);
+            console.error(`[CDN] Erro na Conexão Origem: ${err.message}`);
             this.destroy();
         });
 
@@ -77,50 +84,63 @@ class StreamBroadcaster extends EventEmitter {
 
     addClient(res) {
         this.clients.add(res);
-        if (this.started) {
+        
+        // Se já temos headers, envia agora
+        if (this.headers) {
             this.initClient(res);
+        } else {
+            // Se não, espera ficar pronto
+            this.once('ready', () => this.initClient(res));
+        }
+
+        // Limpeza automática se o cliente sair
+        res.on('close', () => this.removeClient(res));
+        res.on('error', () => this.removeClient(res));
+    }
+
+    removeClient(res) {
+        if (this.clients.has(res)) {
+            this.clients.delete(res);
+            if (!res.writableEnded) res.end();
         }
         
-        // Se o cliente desconectar, removemos da lista
-        res.on('close', () => {
-            this.clients.delete(res);
-            // Se não tiver mais ninguém assistindo, fecha a conexão com a origem
-            if (this.clients.size === 0) {
-                console.log(`[Smart Restream] Zero clientes. Fechando Mestre.`);
-                this.destroy();
-            }
-        });
+        // Se zero clientes, fecha a conexão com a origem para economizar
+        if (this.clients.size === 0) {
+            console.log(`[CDN] Zero espectadores. Encerrando transmissão: ${this.url}`);
+            this.destroy();
+        }
     }
 
     initClient(res) {
         if (res.headersSent) return;
         
-        // Repassar headers importantes
+        // Copia headers essenciais da origem
         if (this.headers['content-type']) res.setHeader('Content-Type', this.headers['content-type']);
         
-        // Não enviar Content-Length em stream compartilhado (pois é contínuo)
-        res.setHeader('Transfer-Encoding', 'chunked'); 
+        // CORS e Configurações de Stream
         res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Connection', 'keep-alive');
         
         res.writeHead(this.statusCode || 200);
     }
 
     destroy() {
-        activeStreams.delete(this.url);
+        activeBroadcasts.delete(this.url);
         if (this.upstreamReq) {
             this.upstreamReq.destroy();
             this.upstreamReq = null;
         }
-        this.clients.forEach(client => client.end());
+        // Encerra todos os clientes suavemente
+        this.clients.forEach(client => {
+            if (!client.writableEnded) client.end();
+        });
         this.clients.clear();
-        this.removeAllListeners();
     }
 }
 
 // ==========================================
 // ROTA PRINCIPAL
 // ==========================================
-
 app.get('/api', (req, res) => {
     // 1. Configurações de CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -155,42 +175,38 @@ app.get('/api', (req, res) => {
     if (!streamUrl) return res.status(400).send("Erro: URL invalida");
 
     // ==========================================
-    // DECISÃO INTELIGENTE: PROXY DIRETO OU SMART?
+    // LÓGICA DE DECISÃO: CACHE vs DIRETO
     // ==========================================
     
-    // Se o player pediu um "Range" (Pedaço do vídeo) ou é VOD (.mp4/.mkv), 
-    // NÃO podemos deduplicar. Tem que ser Proxy Direto (Estável).
+    // Regra: Se pedir RANGE (pedaço) ou for VOD (arquivo fechado), VAI DIRETO.
+    // Isso evita travar filmes ou trocas rápidas.
     const isVOD = streamUrl.match(/\.(mp4|mkv|avi|mov)$/i);
     const hasRange = req.headers.range;
 
     if (hasRange || isVOD) {
-        // MODO 1: PROXY DIRETO (Estável para VOD/Troca de Canal)
-        // console.log(`[Mode: Direct] Cliente pediu Range ou é VOD: ${streamUrl}`);
-        proxyRequest(streamUrl, req, res);
+        // MODO DIRETO (1 Cliente = 1 Conexão)
+        proxyDirect(streamUrl, req, res);
     } else {
-        // MODO 2: SMART RESTREAM (Economia para Live TV)
-        // console.log(`[Mode: Smart] Cliente em Live TV: ${streamUrl}`);
-        
-        if (activeStreams.has(streamUrl)) {
-            // Pega carona na transmissão existente!
-            const broadcaster = activeStreams.get(streamUrl);
+        // MODO CACHE/DEDUPLICAÇÃO (1000 Clientes = 1 Conexão)
+        if (activeBroadcasts.has(streamUrl)) {
+            // Já existe? Entra na sala!
+            const broadcaster = activeBroadcasts.get(streamUrl);
             broadcaster.addClient(res);
         } else {
-            // Cria nova transmissão mestre
-            const broadcaster = new StreamBroadcaster(streamUrl);
-            activeStreams.set(streamUrl, broadcaster);
+            // Não existe? Cria a sala!
+            const broadcaster = new SecureBroadcaster(streamUrl);
+            activeBroadcasts.set(streamUrl, broadcaster);
             broadcaster.addClient(res);
-            
-            // Fallback: Se der erro no Smart, tenta Direct
-            broadcaster.on('error', () => {
-                if (!res.headersSent) proxyRequest(streamUrl, req, res);
+
+            // Se der erro ao criar, tenta o modo direto como fallback
+            broadcaster.once('error', () => {
+                if (!res.headersSent) proxyDirect(streamUrl, req, res);
             });
         }
     }
 });
 
-// Função de Proxy Direto (Fallback e VOD)
-function proxyRequest(url, clientReq, clientRes, redirects = 0) {
+function proxyDirect(url, clientReq, clientRes, redirects = 0) {
     if (redirects > 5) return clientRes.status(502).send("Loop Redirect");
 
     const targetUrl = parse(url);
@@ -205,7 +221,7 @@ function proxyRequest(url, clientReq, clientRes, redirects = 0) {
         }
     }, (proxyRes) => {
         if ([301, 302, 303, 307].includes(proxyRes.statusCode) && proxyRes.headers.location) {
-            return proxyRequest(new URL(proxyRes.headers.location, url).toString(), clientReq, clientRes, redirects + 1);
+            return proxyDirect(new URL(proxyRes.headers.location, url).toString(), clientReq, clientRes, redirects + 1);
         }
 
         if (proxyRes.headers['content-type']) clientRes.setHeader('Content-Type', proxyRes.headers['content-type']);
@@ -218,7 +234,7 @@ function proxyRequest(url, clientReq, clientRes, redirects = 0) {
     });
 
     proxyReq.on('error', (err) => {
-        if (!clientRes.headersSent) clientRes.status(502).send("Erro Proxy");
+        if (!clientRes.headersSent) clientRes.status(502).send("Erro Proxy Direto");
     });
 
     proxyReq.end();
