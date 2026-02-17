@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const url = require('url');
 
 const SECRET_KEY = "VpsManagerStrongKey";
-const PORT = process.env.PORT || 80;
+const PORT = process.env.PORT || 8880;
 
 const server = http.createServer((req, res) => {
     // 1. Validar Parâmetros Básicos
