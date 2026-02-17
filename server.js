@@ -184,14 +184,24 @@ const server = http.createServer(async (req, res) => {
         if (selfUrl.pathname.endsWith('.m3u8')) {
             selfUrl.pathname = selfUrl.pathname.slice(0, -5) + 'ts';
         }
-        const playlist = [
+        let count = parseInt(reqUrl.searchParams.get('segments') || '8');
+        if (!Number.isFinite(count) || count < 3) count = 8;
+        if (count > 20) count = 20;
+        const lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:3",
             "#EXT-X-TARGETDURATION:6",
             "#EXT-X-MEDIA-SEQUENCE:0",
-            "#EXTINF:6,",
-            selfUrl.toString()
-        ].join("\n");
+            "#EXT-X-INDEPENDENT-SEGMENTS"
+        ];
+        for (let i = 0; i < count; i++) {
+            const segUrl = new URL(selfUrl.toString());
+            segUrl.searchParams.set("seg", String(i));
+            segUrl.searchParams.set("_", String(Date.now()));
+            lines.push("#EXTINF:6,");
+            lines.push(segUrl.toString());
+        }
+        const playlist = lines.join("\n");
         res.writeHead(200, {
             'Content-Type': 'application/vnd.apple.mpegurl',
             'Access-Control-Allow-Origin': '*'
