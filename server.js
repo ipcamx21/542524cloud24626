@@ -9,9 +9,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET_KEY = "VpsManagerStrongKey";
 
-// Cache de Autenticação (60 segundos)
+// ==========================================
+// CACHE DE AUTENTICAÇÃO
+// ==========================================
 const authCache = new Map();
-
 function validateUser(authUrl, username, password) {
     return new Promise((resolve) => {
         const cacheKey = `${username}:${password}`;
@@ -23,7 +24,6 @@ function validateUser(authUrl, username, password) {
             targetUrl.searchParams.set('username', username);
             targetUrl.searchParams.set('password', password);
             const lib = targetUrl.protocol === 'https:' ? https : http;
-            
             const req = lib.request(targetUrl.toString(), { method: 'GET', timeout: 5000 }, (res) => {
                 const isValid = res.statusCode === 200;
                 if (isValid) authCache.set(cacheKey, { valid: true, expires: Date.now() + 60000 });
@@ -35,7 +35,9 @@ function validateUser(authUrl, username, password) {
     });
 }
 
-// BROADCASTER BLINDADO
+// ==========================================
+// BROADCAST BLINDADO (SMART RESTREAM)
+// ==========================================
 const activeBroadcasts = new Map();
 
 class SecureBroadcaster extends EventEmitter {
@@ -107,14 +109,20 @@ class SecureBroadcaster extends EventEmitter {
     }
 }
 
+// ==========================================
 // ROTA PRINCIPAL
+// ==========================================
 app.get('/api', async (req, res) => {
+    // CORS Obrigatório
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, User-Agent, Authorization');
+
     if (req.method === 'OPTIONS') return res.status(200).end();
 
-    const { payload, expires, token, auth, mode } = req.query;
+    const { payload, expires, token, auth, ext } = req.query;
 
-    // 1. Validação Básica
+    // 1. Validação
     if (!payload || !expires || !token) return res.status(403).send("E1");
     if (Date.now() / 1000 > parseInt(expires)) return res.status(403).send("E2");
 
@@ -136,27 +144,39 @@ app.get('/api', async (req, res) => {
     const username = parts[1];
     const password = parts[2];
 
-    // 3. Autenticação Remota (Opcional, mas recomendado)
+    // 3. Autenticação Remota
     if (auth && username && password) {
         const isValid = await validateUser(auth, username, password);
         if (!isValid) return res.status(403).send("Bloqueado");
     }
 
-    // 4. WRAPPER M3U8 (Se pedido via cabeçalho ou extensão .m3u8 na URL)
-    // Se o cliente pedir M3U8 mas o modo não for raw, entregamos a playlist falsa
-    const accept = req.headers['accept'] || '';
-    const wantsM3U8 = accept.includes('apple') || accept.includes('mpegurl') || req.url.includes('.m3u8');
+    // ==========================================
+    // DETECÇÃO HÍBRIDA: TS vs M3U8
+    // ==========================================
+    // O IBO Player pede primeiro a playlist. Se a gente não entregar, ele falha.
     
-    if (wantsM3U8 && mode !== 'raw') {
-        // Gera Playlist M3U8 Falsa apontando para si mesmo (Raw Mode)
-        const selfUrl = `${req.protocol}://${req.get('host')}${req.path}?${new URLSearchParams({...req.query, mode: 'raw'}).toString()}`;
+    // Se a URL original termina com .m3u8, o IBO vai adicionar isso no final da URL do proxy?
+    // As vezes sim, as vezes não. O segredo é ver se ele pediu playlist explicitamente.
+    
+    const accept = req.headers['accept'] || '';
+    const urlLooksLikeM3U8 = req.url.includes('.m3u8') || req.url.includes('type=m3u8');
+    const isExplicitTS = ext === '.ts' || req.url.includes('.ts'); // Nosso sinal secreto
+
+    // Se parece M3U8 e NÃO pedimos TS explicitamente -> Manda Playlist Falsa
+    if ((urlLooksLikeM3U8 || accept.includes('mpegurl') || accept.includes('apple')) && !isExplicitTS) {
+        // Gera a URL do "Segmento" (que na verdade é o vídeo contínuo)
+        // Adicionamos &ext=.ts para cair no `else` na próxima requisição
+        const selfUrl = `${req.protocol}://${req.get('host')}${req.path}?${new URLSearchParams({...req.query, ext: '.ts'}).toString()}`;
         
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.setHeader('Content-Disposition', 'inline; filename="stream.m3u8"');
+        
         return res.send(`#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:-1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:-1,Stream\n${selfUrl}`);
     }
 
-    // 5. STREAMING REAL (Raw Mode)
+    // ==========================================
+    // ENTREGA DO VÍDEO (STREAMING)
+    // ==========================================
     const isVOD = streamUrl.match(/\.(mp4|mkv|avi|mov)$/i);
     const hasRange = req.headers.range;
 
