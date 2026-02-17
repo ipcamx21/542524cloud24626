@@ -95,9 +95,13 @@ const server = http.createServer(async (req, res) => {
 
     // --- LÓGICA DE EXTRAÇÃO M3U8 (NODE.JS) ---
     // Se a URL original for M3U8 ou o payload indicar isso, tentamos extrair o TS primeiro.
+    // Isso é crucial para players como IBO Player que pedem .ts mas a fonte é .m3u8
     const isM3U8 = targetUrl.includes(".m3u8") || targetUrl.includes(".m3u");
     
+    console.log(`[PROXY] Nova Requisição: ${targetUrl} | M3U8 Detectado: ${isM3U8}`);
+
     if (isM3U8) {
+        console.log(`[PROXY] Iniciando extração de M3U8 para: ${targetUrl}`);
         // Tenta baixar o m3u8 primeiro para extrair o TS
         const m3uOptions = {
             hostname: target.hostname,
@@ -117,6 +121,7 @@ const server = http.createServer(async (req, res) => {
             let data = '';
             m3uRes.on('data', (chunk) => data += chunk);
             m3uRes.on('end', () => {
+                console.log(`[PROXY] M3U8 Baixado. Status: ${m3uRes.statusCode}. Tamanho: ${data.length}`);
                 if (data.includes("#EXTM3U")) {
                     const lines = data.split('\n');
                     let tsUrl = "";
@@ -129,6 +134,7 @@ const server = http.createServer(async (req, res) => {
                     }
 
                     if (tsUrl) {
+                        console.log(`[PROXY] TS Extraído com sucesso: ${tsUrl}`);
                         // Resolver URL relativa
                         if (!tsUrl.startsWith("http")) {
                             const base = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
@@ -148,14 +154,19 @@ const server = http.createServer(async (req, res) => {
                         const tsTarget = new URL(tsUrl);
                         proxyRequest(tsTarget, req, res, spoofedUA);
                         return;
+                    } else {
+                        console.log(`[PROXY] Nenhuma linha válida encontrada no M3U8`);
                     }
+                } else {
+                    console.log(`[PROXY] Conteúdo não parece ser M3U8 válido (sem #EXTM3U)`);
                 }
                 // Se falhar na extração, faz proxy da URL original
                 proxyRequest(target, req, res, spoofedUA);
             });
         });
         
-        m3uReq.on('error', () => {
+        m3uReq.on('error', (e) => {
+            console.error(`[PROXY] Erro ao baixar M3U8: ${e.message}`);
             // Se der erro ao baixar m3u8, tenta proxy direto
             proxyRequest(target, req, res, spoofedUA);
         });
@@ -189,12 +200,16 @@ function proxyRequest(target, req, res, ua) {
     delete options.headers['connection'];
 
     const proxyReq = (target.protocol === 'https:' ? https : http).request(options, (proxyRes) => {
+        // Forward Status
         const headers = { ...proxyRes.headers };
         headers['Access-Control-Allow-Origin'] = '*';
         headers['Access-Control-Expose-Headers'] = 'Content-Length, Content-Range, Content-Type';
         delete headers['content-security-policy'];
         delete headers['x-frame-options'];
 
+        // Se for M3U8 forçado para TS, ajusta content-type
+        // Mas como já extraímos o TS antes (se for o caso), o content-type deve vir certo da origem
+        
         res.writeHead(proxyRes.statusCode, headers);
         proxyRes.pipe(res);
     });
@@ -207,12 +222,14 @@ function proxyRequest(target, req, res, ua) {
         }
     });
 
+    // --- CRITICAL: HANDLE CLIENT DISCONNECT ---
     req.on('close', () => {
         if (proxyReq) {
-            proxyReq.destroy();
+            proxyReq.destroy(); // Kill upstream connection immediately
         }
     });
 
+    // Pipe Request Body (for POSTs)
     req.pipe(proxyReq);
 }
 
