@@ -73,6 +73,8 @@ function decodeToken(token) {
     return json;
 }
 
+const streamPool = new Map();
+
 http.createServer((req, res) => {
     try {
         const base = `http://${req.headers.host || 'localhost'}`;
@@ -127,68 +129,147 @@ http.createServer((req, res) => {
             hbInterval = setInterval(() => quickGet(updateUrl), 20000);
         }
 
-        let upstreamReq;
+        const key = upstreamUrl.toString();
 
-        function startRequest(currentUrl, redirectCount) {
-            const lib = currentUrl.protocol === 'https:' ? https : http;
-            const headers = {};
-            if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
-            else headers['User-Agent'] = 'Mozilla/5.0';
-            headers['Accept'] = '*/*';
-            if (req.headers['range']) headers['Range'] = req.headers['range'];
-            headers['Host'] = currentUrl.host;
+        let stream = streamPool.get(key);
+        if (!stream) {
+            stream = {
+                url: upstreamUrl,
+                statusCode: null,
+                headers: null,
+                clients: new Set(),
+                upstreamReq: null,
+                ended: false
+            };
+            streamPool.set(key, stream);
 
-            upstreamReq = lib.request(currentUrl, {
-                method: 'GET',
-                headers,
-                timeout: 60000
-            }, upstreamRes => {
-                const statusCode = upstreamRes.statusCode || 0;
-                if (statusCode >= 300 && statusCode < 400 && upstreamRes.headers.location && redirectCount < 5) {
-                    let nextUrl;
-                    try {
-                        nextUrl = new URL(upstreamRes.headers.location, currentUrl);
-                    } catch (e) {
-                        if (!res.headersSent) {
-                            res.writeHead(502, { 'Content-Type': 'text/plain' });
-                            res.end('Bad redirect');
+            function startRequest(currentUrl, redirectCount) {
+                const lib = currentUrl.protocol === 'https:' ? https : http;
+                const headers = {};
+                if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
+                else headers['User-Agent'] = 'Mozilla/5.0';
+                headers['Accept'] = '*/*';
+                headers['Host'] = currentUrl.host;
+
+                stream.upstreamReq = lib.request(currentUrl, {
+                    method: 'GET',
+                    headers,
+                    timeout: 60000
+                }, upstreamRes => {
+                    const statusCode = upstreamRes.statusCode || 0;
+                    if (statusCode >= 300 && statusCode < 400 && upstreamRes.headers.location && redirectCount < 5) {
+                        let nextUrl;
+                        try {
+                            nextUrl = new URL(upstreamRes.headers.location, currentUrl);
+                        } catch (e) {
+                            stream.clients.forEach(c => {
+                                if (!c.res.headersSent) c.res.writeHead(502, { 'Content-Type': 'text/plain' });
+                                c.res.end('Bad redirect');
+                            });
+                            streamPool.delete(key);
+                            return;
                         }
+                        upstreamRes.resume();
+                        startRequest(nextUrl, redirectCount + 1);
                         return;
                     }
-                    upstreamRes.resume();
-                    startRequest(nextUrl, redirectCount + 1);
-                    return;
-                }
-                const respHeaders = Object.assign({}, upstreamRes.headers);
-                respHeaders['Access-Control-Allow-Origin'] = '*';
-                res.writeHead(statusCode || 502, respHeaders);
-                upstreamRes.pipe(res);
-                upstreamRes.on('close', () => {
-                    if (cid > 0 && authUrl) {
-                        const delUrl = `${authUrl}?action=delete&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
-                        quickGet(delUrl);
-                    }
+
+                    stream.statusCode = statusCode || 502;
+                    stream.headers = Object.assign({}, upstreamRes.headers, {
+                        'Access-Control-Allow-Origin': '*'
+                    });
+
+                    stream.clients.forEach(c => {
+                        if (!c.headersSent) {
+                            c.res.writeHead(stream.statusCode, stream.headers);
+                            c.headersSent = true;
+                        }
+                    });
+
+                    upstreamRes.on('data', chunk => {
+                        stream.clients.forEach(c => {
+                            if (!c.closed) {
+                                try {
+                                    c.res.write(chunk);
+                                } catch (_) {
+                                    c.closed = true;
+                                    c.res.end();
+                                }
+                            }
+                        });
+                    });
+
+                    upstreamRes.on('end', () => {
+                        stream.ended = true;
+                        stream.clients.forEach(c => {
+                            if (!c.closed) {
+                                c.res.end();
+                                c.closed = true;
+                            }
+                        });
+                        streamPool.delete(key);
+                    });
+
+                    upstreamRes.on('error', () => {
+                        stream.clients.forEach(c => {
+                            if (!c.closed) {
+                                if (!c.res.headersSent) {
+                                    c.res.writeHead(502, { 'Content-Type': 'text/plain' });
+                                }
+                                c.res.end('Proxy Error');
+                                c.closed = true;
+                            }
+                        });
+                        streamPool.delete(key);
+                    });
                 });
-            });
 
-            upstreamReq.on('error', () => {
-                if (!res.headersSent) {
-                    res.writeHead(502, { 'Content-Type': 'text/plain' });
-                    res.end('Proxy Error');
-                }
-            });
+                stream.upstreamReq.on('error', () => {
+                    stream.clients.forEach(c => {
+                        if (!c.closed) {
+                            if (!c.res.headersSent) {
+                                c.res.writeHead(502, { 'Content-Type': 'text/plain' });
+                            }
+                            c.res.end('Proxy Error');
+                            c.closed = true;
+                        }
+                    });
+                    streamPool.delete(key);
+                });
 
-            upstreamReq.on('timeout', () => {
-                upstreamReq.destroy();
-            });
+                stream.upstreamReq.on('timeout', () => {
+                    stream.upstreamReq.destroy();
+                });
 
-            upstreamReq.end();
-        }
+                stream.upstreamReq.end();
+            }
 
         startRequest(upstreamUrl, 0);
+        }
+
+        const client = { res, headersSent: false, closed: false };
+        stream.clients.add(client);
+
+        if (stream.headers && !client.headersSent) {
+            res.writeHead(stream.statusCode, stream.headers);
+            client.headersSent = true;
+        }
+
+        function detachClient() {
+            if (client.closed) return;
+            client.closed = true;
+            try { res.end(); } catch (_) {}
+            stream.clients.delete(client);
+            if (stream.clients.size === 0) {
+                if (stream.upstreamReq && !stream.upstreamReq.destroyed) {
+                    stream.upstreamReq.destroy();
+                }
+                streamPool.delete(key);
+            }
+        }
 
         req.on('close', () => {
-            if (!upstreamReq.destroyed) upstreamReq.destroy();
+            detachClient();
             if (cid > 0 && authUrl) {
                 const delUrl = `${authUrl}?action=delete&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
                 quickGet(delUrl);
@@ -197,6 +278,7 @@ http.createServer((req, res) => {
         });
 
         res.on('close', () => {
+            detachClient();
             if (cid > 0 && authUrl) {
                 const delUrl = `${authUrl}?action=delete&username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&cid=${cid}`;
                 quickGet(delUrl);
